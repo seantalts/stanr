@@ -27,9 +27,6 @@
  * deriving from empty_value.
  */
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wshadow"
 #else
-#pragma GCC diagnostic pop
 #endif
 #endif

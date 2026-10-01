@@ -52,6 +52,27 @@ cp -Rf "$STAN_SRC/lib/rapidjson_1.1.0/rapidjson" "$INC/rapidjson"
 # Makevars: cp -Rf math/stan/. ../inst/include/stan
 cp -Rf "$MATH_SRC/stan/." "$INC/stan"
 
+# libc++'s std::string_view iterators are not necessarily raw pointers, while
+# std::from_chars requires pointers. Keep the pinned Stan Math header usable
+# in webR's Emscripten/libc++ build without changing its parsing behavior.
+python3 - "$INC/stan/math/prim/core/init_threadpool_tbb.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = """  const auto [end, error]
+      = std::from_chars(value.begin(), value.end(), num_threads);
+  if (error != std::errc() || end != value.end()
+"""
+new = """  const auto* value_end = value.data() + value.size();
+  const auto [end, error]
+      = std::from_chars(value.data(), value_end, num_threads);
+  if (error != std::errc() || end != value_end
+"""
+assert text.count(old) == 1, "Stan Math thread-count parser changed upstream"
+open(path, "w").write(text.replace(old, new, 1))
+EOF
+
 # --- 4. Vendor the OpenCL headers ------------------------------------------
 # Makevars: cp -Rf math/lib/opencl_*/CL ../inst/include/
 rm -rf "$INC/CL"
@@ -334,6 +355,28 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/math "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/numeric "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/serialization "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/unordered "$INC/boost"
+
+# R CMD check warns on diagnostic-suppression pragmas in installed headers.
+# They affect warning presentation only, not Boost.Unordered's behavior. Strip
+# the GCC/Clang diagnostic pragmas while retaining MSVC pragmas and `#pragma once`.
+python3 - "$INC/boost/unordered" << 'EOF'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+diagnostic = re.compile(
+    r"(?m)^[ \t]*#[ \t]*pragma[ \t]+"
+    r"(?:GCC|clang)[ \t]+diagnostic.*\n"
+)
+removed = 0
+for path in root.rglob("*.hpp"):
+    text, count = diagnostic.subn("", path.read_text())
+    if count:
+        path.write_text(text)
+        removed += count
+assert removed == 15, f"expected 15 Boost.Unordered diagnostic pragmas, found {removed}"
+EOF
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/container_hash "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/describe "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/preprocessor "$INC/boost"

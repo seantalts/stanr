@@ -49,14 +49,11 @@ struct archive_constructed:private noncopyable
 #endif
 
 #if defined(BOOST_UNORDERED_IGNORE_WSTRICT_ALIASING)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 
   T& get(){return *space.address();}
 
 #if defined(BOOST_UNORDERED_IGNORE_WSTRICT_ALIASING)
-#pragma GCC diagnostic pop
 #undef BOOST_UNORDERED_IGNORE_WSTRICT_ALIASING
 #endif
 

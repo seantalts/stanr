@@ -10,8 +10,6 @@
 #ifndef BOOST_ALL_NO_EMBEDDED_GDB_SCRIPTS
 #if defined(__ELF__)
 #ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Woverlength-strings"
 #endif
 __asm__(".pushsection \".debug_gdb_scripts\", \"MS\",@progbits,1\n"
         ".ascii \"\\4gdb.inlined-script.BOOST_UNORDERED_UNORDERED_PRINTERS_HPP\\n\"\n"
@@ -406,7 +404,6 @@ __asm__(".pushsection \".debug_gdb_scripts\", \"MS\",@progbits,1\n"
         ".byte 0\n"
         ".popsection\n");
 #ifdef __clang__
-#pragma clang diagnostic pop
 #endif
 #endif // defined(__ELF__)
 #endif // !defined(BOOST_ALL_NO_EMBEDDED_GDB_SCRIPTS)

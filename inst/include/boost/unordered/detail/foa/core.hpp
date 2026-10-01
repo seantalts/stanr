@@ -1460,8 +1460,6 @@ public:
 #endif
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
   table_core(
@@ -1473,7 +1471,6 @@ public:
     {}
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic pop
 #endif
 
   /* genericize on an ArraysFn so that we can do things like delay an
@@ -2091,8 +2088,6 @@ private:
   using allocator_base=empty_value<Allocator,2>;
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
   /* used by allocator-extended move ctor */
@@ -2106,7 +2101,6 @@ private:
   }
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic pop
 #endif
 
   arrays_type new_arrays(std::size_t n)const
