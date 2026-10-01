@@ -301,6 +301,28 @@ EOF
 # structured_writer now uses uint32_t/uint64_t overloads and needs no shim.
 patch_size_t_overload "$INC/stan/callbacks/json_writer.hpp" 1
 
+# Pathfinder writes platform-sized counters through structured_writer's
+# uint64_t overload. On platforms where size_t is a different 64-bit type,
+# overload resolution is ambiguous without an explicit conversion.
+python3 - "$INC/stan/services/pathfinder/single.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old_include = "#include <atomic>\n"
+assert text.count(old_include) == 1, "atomic include changed in Pathfinder"
+text = text.replace(old_include, old_include + "#include <cstdint>\n", 1)
+for old, new, expected in (
+    ('diagnostic_writer.write("iter", lbfgs.iter_num());',
+     'diagnostic_writer.write("iter", static_cast<std::uint64_t>(lbfgs.iter_num()));', 1),
+    ('diagnostic_writer.write("history_size", history_size);',
+     'diagnostic_writer.write("history_size", static_cast<std::uint64_t>(history_size));', 3),
+):
+    assert text.count(old) == expected, f"Pathfinder write changed: {old}"
+    text = text.replace(old, new)
+open(path, "w").write(text)
+EOF
+
 # --- 7. TBB ------------------------------------------------------------
 # TBB is not vendored from the CmdStan/math bundle -- see tools/upgrade_tbb.sh,
 # which vendors a standalone oneTBB release (headers into inst/include,
