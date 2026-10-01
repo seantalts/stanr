@@ -467,7 +467,37 @@ inline std::vector<double> graph_order(const DataMap::Entry& en,
   return graph_container_order(en.r, en.dims, outer_rank);
 }
 
+struct DeclView {
+  int64_t len = 0;
+  bool autodiff = false;
+  SlotInfo si;
+  bool int_array = false;
+  bool deferred_shape = false;
+  std::vector<int> runtime_dims;
+};
+
+// A lifetime-bound view of the prepared facts handed from the completed
+// log-probability lowering to write_array. The integer map is the one snapshot
+// bind_data retains; the other references preserve the established handoff
+// timing without another O(data bytes) copy.
+struct PreparedContext {
+  const WaRng& rng;
+  const std::shared_ptr<ShapeInterner>& shapes;
+  const std::map<std::string, DataMap::Entry>& environment;
+  const std::map<std::string, long>& integers;
+  const std::map<std::string, DeclView>& declarations;
+};
+
 struct Lowering {
+  // A bounded alternative is built in its own Lowering. Refusal discards that
+  // entire instance; no partially specialized graph is ever published.
+  struct SpecializationRefused {};
+  bool bounded_specialization = false;
+  uint64_t specialization_steps = 0;
+  uint64_t specialization_elements = 0;
+  static constexpr uint64_t specialization_step_limit = 131072;
+  static constexpr uint64_t specialization_slot_limit = 65536;
+  static constexpr uint64_t specialization_element_limit = 1048576;
   struct Val {
     int slot;
     bool autodiff = false;  // instantiated C++ scalar type carries var
@@ -749,6 +779,18 @@ struct Lowering {
       fail(what + ": needs one runtime logical extent");
     return v.runtime_dims[0];
   }
+  // Vectors store one logical extent, regardless of orientation. A negative
+  // axis denotes the other, singleton matrix dimension (rows of a row vector
+  // or columns of a column vector).
+  int runtime_shape_axis(const Val& v, const std::string& query) const {
+    if (is_vector(v.si) || is_row_vector(v.si)) {
+      if ((query == "rows" && is_row_vector(v.si)) ||
+          (query == "cols" && is_vector(v.si)))
+        return -1;
+      return 0;
+    }
+    return query == "cols" ? 1 : 0;
+  }
   const DataMap& data;
   std::shared_ptr<ShapeInterner> shape_pool;
   PrepTrace& prep;
@@ -756,10 +798,21 @@ struct Lowering {
   const char* prep_graph;
   const char* last_stage = "start";
   std::vector<int> last_roots;
+  // Transformed data's RNG stream. CmdStan's generated constructor seeds it
+  // with the run seed and chain 0 and runs the section once per model, so
+  // every chain sees the same draws; stanli evaluates the section once at
+  // load and bakes it into both graphs, which makes the seed a compile
+  // input like the data. The write_array lowering never runs prepare_data
+  // (it copies this lowering's environment), so its stream is never drawn.
+  WaRng td_rng;
   // The MIR interpreter instance for everything DataOnly: prepare_data,
   // data-only conditions, size expressions. Its environment doubles as the
   // lowering's view of transformed data. Hooks route FnReadData to the
-  // DataMap and unknown variables to the unrolled-loop int environment.
+  // DataMap, unknown variables to the unrolled-loop int environment, and
+  // RNG draws to td_rng through the same handler interpreted write_array
+  // uses. Compile-time folding of model and generated-quantities
+  // expressions goes through try_eval_interpreter, which refuses anything
+  // expr_effectful (every `_rng`), so those draws cannot reach this stream.
   MirInterp<double> td{
       fun_defs, "prepare_data",
       MirHooks{[this](const std::string& n) -> const DataMap::Entry* {
@@ -771,11 +824,16 @@ struct Lowering {
                  *out = it->second;
                  return true;
                },
-               [this](const mir::Expr& e, DataMap::Entry* out) {
+               [this](MirInterp<double>& in, const mir::Expr& e,
+                      DataMap::Entry* result) {
+                 if (interpreted_rng_call(in, e, result, td_rng)) {
+                   out.transformed_data_draws = true;
+                   return true;
+                 }
                  return evaluate_retained_higher_order(
                      fun_defs, e,
-                     [this](const mir::Expr& arg) { return td.eval(arg); },
-                     out);
+                     [&in](const mir::Expr& arg) { return in.eval(arg); },
+                     result);
                }}};
   Graph g;
   CompiledModel out;
@@ -789,6 +847,8 @@ struct Lowering {
   // finite runtime scalar bounds
   // Definite initialization proof for the target construction grammar.
   // Writes must extend one contiguous prefix; gaps/strides fail closed.
+  // -1 means the entire runtime logical extent, excluding unused capacity.
+  // Only bounded output reductions consume that stronger shape-aware proof.
   std::map<int, int64_t> int_initialized_prefix;
   std::map<double, int> const_cache;
   struct ObservationKey {
@@ -804,6 +864,7 @@ struct Lowering {
   std::map<ObservationKey, DataMap::Entry> observations;
   std::vector<int> target_terms;
   std::vector<int> jac_slots;
+  std::vector<int> extra_roots;
   std::map<std::string, const mir::FunDef*> fun_defs;
   // A generic UDF keeps one scalar template type per formal. Locals and its
   // return use the promoted type, but a direct formal reference keeps its own.
@@ -815,9 +876,11 @@ struct Lowering {
   // Names the reduce_sum rewrite binds its lowered slice under, kept
   // distinct so nested calls do not share one.
   int reduce_sum_slices = 0;
+  CompileOptions compile_options;
   // int_env as bind_data left it, before either section's locals and loop
   // variables were folded in; the write_array lowering starts from this.
   std::map<std::string, long> int_env_data;
+  bool data_prepared = false;
   // Lowering generate_quantities rather than log_prob: parameters are columns
   // to emit, not values to differentiate.
   bool in_write_array = false;
@@ -842,6 +905,11 @@ struct Lowering {
   // its collapsed trip counts. TargetPE consumes the product at the edge,
   // so nested invariant loops still emit one scale rather than a MUL chain.
   double target_scale = 1.0;
+  // Automatic symbolic-lane probe: only the terminal unconditional model loop.
+  // False leaves ordinary lowering untouched; true handles the whole loop.
+  const mir::Stmt* symbolic_lane_tail = nullptr;
+  bool try_lower_symbolic_lane_tail(const mir::Stmt& s, int64_t first,
+                                    int64_t last);
   // OR of the actual real/container scalar types for the current inlined
   // UDF. Generic AutoDiffable locals and returns instantiate to this type.
   bool udf_autodiff_ctx = false;
@@ -856,8 +924,15 @@ struct Lowering {
 
   explicit Lowering(
       const DataMap& d, PrepTrace& p, PassDumper& dump_to,
-      const char* graph_name,
+      const char* graph_name, WaRng stream,
       std::shared_ptr<ShapeInterner> pool = std::make_shared<ShapeInterner>());
+  Lowering(const DataMap& d, PrepTrace& p, PassDumper& dump_to,
+           const char* graph_name, const PreparedContext& prepared_context);
+  struct RegionTrialTag {};
+  Lowering(Lowering& parent, RegionTrialTag);
+
+  PreparedContext prepared_context();
+  Lowering fork_region_trial();
 
   void dump_named(const std::string& label, const std::string& name,
                   const std::vector<int>& roots, bool unfiltered);
@@ -908,7 +983,31 @@ struct Lowering {
     return it == observations.end() ? nullptr : &it->second;
   }
   void forget_observation(const Val& v) { observations.erase({v.slot, v.si}); }
-  int add_slot(int64_t len, bool is_param) { return g.add_slot(len, is_param); }
+  void check_slot_budget(int64_t len) {
+    if (bounded_output) {
+      if (len < 0 || g.slots.size() >= 256 ||
+          uint64_t(len) > 8192 - bounded_output_elements ||
+          uint64_t(len) > (65536 - bounded_output_weighted_elements) /
+                              bounded_output_multiplier)
+        fail("bounded output block exceeds storage budget");
+    }
+  }
+  int add_slot(int64_t len, bool is_param) {
+    if (bounded_output) {
+      check_slot_budget(len);
+      bounded_output_elements += uint64_t(len);
+      bounded_output_weighted_elements +=
+          uint64_t(len) * bounded_output_multiplier;
+    }
+    if (bounded_specialization) {
+      if (len < 0 || g.slots.size() >= specialization_slot_limit ||
+          uint64_t(len) >
+              specialization_element_limit - specialization_elements)
+        throw SpecializationRefused{};
+      specialization_elements += uint64_t(len);
+    }
+    return g.add_slot(len, is_param);
+  }
   void note_interpreter_fallback(const std::string& what,
                                  const std::string& why) {
     const std::string note = what + " (" + why + ")";
@@ -976,7 +1075,8 @@ struct Lowering {
     return out;
   }
   void set_int_range(const Val& v, int64_t lo, int64_t hi) {
-    int_initialized_prefix[v.slot] = g.slots[v.slot].len;
+    int_initialized_prefix[v.slot] =
+        bounded_output && has_runtime_shape(v) ? -1 : g.slots[v.slot].len;
     if (lo < std::numeric_limits<int32_t>::min() ||
         hi > std::numeric_limits<int32_t>::max() || lo > hi) {
       int_ranges.erase(v.slot);
@@ -1253,10 +1353,12 @@ struct Lowering {
   void sync_data_local(const std::string& name, const mir::Expr& rhs,
                        const Val& v);
 
+  void assign_plain(const mir::Stmt& s);
+
   void sync_indexed_data_local(const std::string& name, const Val& v) {
-    td.env().erase(name);
+    td_erase(name);
     if (!v.si.param_free) return;
-    if (const DataMap::Entry* en = observation(v)) td.env()[name] = *en;
+    if (const DataMap::Entry* en = observation(v)) td_assign(name, *en);
   }
   void observe_indexed_rhs(const mir::Expr& rhs, const Val& v);
 
@@ -1380,6 +1482,46 @@ struct Lowering {
         std::find(out->begin(), out->end(), s.lhs) == out->end())
       out->push_back(s.lhs);
     for (const auto& k : s.body) assigned_names(k, out);
+  }
+  bool invariant_for_upper(const mir::Stmt& s) {
+    if (expr_effectful(s.upper)) return false;
+    mir::Expr upper = s.upper;
+    specialize_static_shapes(&upper);
+    std::vector<std::string> written;
+    for (const auto& child : s.body) assigned_names(child, &written);
+    for (const auto& name : written) {
+      if (!expr_references(upper, name)) continue;
+      const auto value = scope.find(name);
+      if (value == scope.end() || !has_runtime_shape(value->second))
+        return false;
+      // Indexed writes change elements, not a local's declaration-time
+      // extent snapshot. Such a shape query is invariant without being
+      // compile-time constant. Whole assignments and redeclarations need
+      // a separate proof and remain excluded here.
+      const auto changes_shape = [&](const auto& self,
+                                     const mir::Stmt& body) -> bool {
+        if ((body.kind == mir::Stmt::Assignment && body.lhs == name &&
+             body.lhs_idx.empty()) ||
+            (body.kind == mir::Stmt::Decl && body.decl_id == name))
+          return true;
+        for (const auto& child : body.body)
+          if (self(self, child)) return true;
+        return false;
+      };
+      if (changes_shape(changes_shape, s)) return false;
+      const auto reads_elements = [&](const auto& self,
+                                      const mir::Expr& e) -> bool {
+        if (is_shape_query(e) && e.args[0].kind == mir::Expr::Var &&
+            e.args[0].name == name)
+          return false;
+        if (e.kind == mir::Expr::Var && e.name == name) return true;
+        for (const auto& arg : e.args)
+          if (self(self, arg)) return true;
+        return false;
+      };
+      if (reads_elements(reads_elements, upper)) return false;
+    }
+    return true;
   }
   // Remove a return at the lexical end of a statement arm, preserving every
   // statement that precedes it.  This is the structured form used by UDFs
@@ -1535,6 +1677,18 @@ struct Lowering {
   // never fold because their value is instantiation-dependent.
   bool expr_effectful(const mir::Expr& e);
 
+  struct UdfBinding {
+    bool is_int = false;
+    long iv = 0;
+    Val v{-1, false, {}};
+    std::optional<DataMap::Entry> data;
+    bool formal_data_only = false;
+  };
+  using UdfSpecialization =
+      std::function<std::optional<Val>(const std::vector<UdfBinding>&)>;
+  std::optional<Val> try_lower_parallel_reduce_sum(
+      const mir::Expr& call, const std::vector<UdfBinding>& binds,
+      int64_t count, int64_t grain, bool fixed_partition);
   bool reduce_sum_effectful(const mir::Expr& e) {
     if (e.args.empty() || e.args[0].kind != mir::Expr::Var) return true;
     bool propto = false;
@@ -1715,7 +1869,8 @@ struct Lowering {
   // scope, and the body lowers like any other statements (loops unroll,
   // data-only conditions resolve). Return throws the result value out.
   Val lower_call_udf(const mir::Expr& e,
-                     const std::function<void()>& before_body = {});
+                     const std::function<void()>& before_body = {},
+                     const UdfSpecialization& specialize = {});
 
   Val lower_multi_normal_rng(const mir::Expr& e, CallArguments& actuals);
 
@@ -1730,10 +1885,17 @@ struct Lowering {
   Val lower_scalar_rng(const mir::Expr& e, CallArguments& actuals,
                        ScalarRng family);
 
-  static bool is_int_sum_surface(const mir::Expr& e) {
+  static bool is_int_sum_surface(const mir::Expr& e,
+                                 bool allow_promoted = false) {
+    // Parsing folds a scalar int-to-real Promotion onto the call. Its
+    // integer-array argument still selects Stan's integer sum overload.
+    const bool scalar_result =
+        (e.type_ == "UInt" && e.unsized.leaf == mir::UnsizedLeaf::Int) ||
+        (allow_promoted && e.promoted && e.type_ == "UReal" &&
+         e.unsized.leaf == mir::UnsizedLeaf::Real);
     return e.kind == mir::Expr::FunApp && e.fn_lib == mir::Expr::Lib::StanLib &&
-           e.name == "sum" && e.args.size() == 1 && e.type_ == "UInt" &&
-           e.unsized.leaf == mir::UnsizedLeaf::Int && e.unsized.depth == 0 &&
+           e.name == "sum" && e.args.size() == 1 && scalar_result &&
+           e.unsized.depth == 0 &&
            e.args[0].unsized.leaf == mir::UnsizedLeaf::Int &&
            e.args[0].unsized.depth == 1;
   }
@@ -1773,21 +1935,9 @@ struct Lowering {
 
   mir::Expr slice_bound_literal(int64_t value, const std::string& raw);
 
-  // reduce_sum(f, sliced, grainsize, shared...) sums f over the terms of a
-  // partition of `sliced`, and its contract is that the partition is
-  // unobservable: the terms must sum to the same value however the slice is
-  // cut. Stan Math without STAN_THREADS takes that freedom to its limit and
-  // makes exactly one call over the whole slice, returning zero for an empty
-  // one (prim/functor/reduce_sum.hpp). stanli has no threading, so it lowers
-  // to that same single call. That is not an approximation to be reconciled
-  // later: it agrees with default CmdStan term for term, and it is also the
-  // fastest shape available here, because cutting the slice would shorten
-  // the callee's vectorized densities and buy nothing back.
-  //
-  // Written out, the call is an ordinary user-function call, so this rewrites
-  // it to f(sliced, 1, size(sliced), shared...) and hands that to the
-  // inliner, which already owns argument binding, propto threading, and the
-  // data-only formal rules.
+  // Default/refused calls inline one whole-slice callback, preserving the
+  // ordinary binder's argument evaluation, propto and data-only rules.
+  // Native opt-in retains compact children after fixed-shape/effect proofs.
   Val lower_reduce_sum(const mir::Expr& e, CallArguments& actuals);
 
   Val lower_append_array(const mir::Expr& e, CallArguments& actuals);
@@ -1864,21 +2014,101 @@ struct Lowering {
 
   void lower_read_param(const mir::Stmt& s);
 
-  struct DeclView {
-    int64_t len = 0;
-    bool autodiff = false;
-    SlotInfo si;
-    bool int_array = false;
-    bool deferred_shape = false;
-    std::vector<int> runtime_dims;
-  };
   // The only name-keyed declaration protocol. Runtime values carry the same
   // static scalar type and SlotInfo in `scope`; this registry is needed only
   // before first binding.
   std::map<std::string, DeclView> decls;
+
+  std::vector<std::pair<std::string, std::optional<DataMap::Entry>>> td_journal;
+  void td_erase(const std::string& name) {
+    auto it = td.env().find(name);
+    if (it == td.env().end()) return;
+    if (in_write_array) td_journal.emplace_back(name, it->second);
+    td.env().erase(it);
+  }
+  void td_assign(const std::string& name, DataMap::Entry value) {
+    if (in_write_array) {
+      auto it = td.env().find(name);
+      td_journal.emplace_back(name,
+                              it == td.env().end()
+                                  ? std::nullopt
+                                  : std::optional<DataMap::Entry>(it->second));
+    }
+    td.env()[name] = std::move(value);
+  }
+  void td_rollback(size_t mark) {
+    while (td_journal.size() > mark) {
+      auto& [name, prior] = td_journal.back();
+      if (prior)
+        td.env()[name] = std::move(*prior);
+      else
+        td.env().erase(name);
+      td_journal.pop_back();
+    }
+  }
+
+  // Fills only grow and are truncated back, the graph is untouched, and the
+  // data environment is journaled, so none of them is copied.
+  struct WaSnapshot {
+    std::map<std::string, Val> scope;
+    std::map<std::string, DeclView> decls;
+    std::map<std::string, long> int_env;
+    std::set<std::string> int_locals;
+    std::optional<size_t> n_tp_start, n_gq_start;
+    CompiledModel out;
+    std::map<int, IntRange> int_ranges;
+    std::map<int, RealRange> real_ranges;
+    size_t n_fills = 0, n_ops = 0, n_slots = 0, n_idata = 0, td_mark = 0;
+  };
+  WaSnapshot wa_snapshot() {
+    WaSnapshot s;
+    s.scope = scope;
+    s.decls = decls;
+    s.int_env = int_env;
+    s.int_locals = int_locals;
+    s.n_tp_start = n_tp_start;
+    s.n_gq_start = n_gq_start;
+    auto fills = std::move(out.fills);
+    auto graph = std::move(out.graph);
+    s.out = out;
+    out.fills = std::move(fills);
+    out.graph = std::move(graph);
+    s.n_fills = out.fills.size();
+    s.int_ranges = int_ranges;
+    s.real_ranges = real_ranges;
+    s.n_ops = g.ops.size();
+    s.n_slots = g.slots.size();
+    s.n_idata = g.idata_pool.size();
+    s.td_mark = td_journal.size();
+    return s;
+  }
+  void wa_restore(WaSnapshot& s) {
+    scope = std::move(s.scope);
+    decls = std::move(s.decls);
+    int_env = std::move(s.int_env);
+    int_locals = std::move(s.int_locals);
+    n_tp_start = s.n_tp_start;
+    n_gq_start = s.n_gq_start;
+    auto fills = std::move(out.fills);
+    auto graph = std::move(out.graph);
+    out = std::move(s.out);
+    out.fills = std::move(fills);
+    out.graph = std::move(graph);
+    out.fills.erase(out.fills.begin() + (std::ptrdiff_t)s.n_fills,
+                    out.fills.end());
+    int_ranges = std::move(s.int_ranges);
+    real_ranges = std::move(s.real_ranges);
+    g.ops.resize(s.n_ops);
+    g.slots.resize(s.n_slots);
+    g.idata_pool.resize(s.n_idata);
+    td_rollback(s.td_mark);
+  }
 #include "lower_structured_loop.inc"
 
   void lower_stmt(const mir::Stmt& s) {
+    if (bounded_specialization &&
+        ++specialization_steps > specialization_step_limit)
+      throw SpecializationRefused{};
     if (region_current) {
       lower_region_stmt(s);
       return;

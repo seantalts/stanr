@@ -20,6 +20,8 @@
 #ifndef STANLI_MIR_INTERP_HPP
 #define STANLI_MIR_INTERP_HPP
 
+#include <stanli/execution_report.hpp>
+
 #include <stanli/compile.hpp>
 #include <stanli/container_shape.hpp>
 #include <stanli/data.hpp>
@@ -68,7 +70,10 @@ struct MirValFor<double> {
   using type = DataMap::Entry;
 };
 
-// Host hooks, all optional. The lowering installs the first two; the
+template <typename T>
+class MirInterp;
+
+// Host hooks, all optional. The lowering installs the first three; the
 // interpreted write_array installs the last two (they only fire on the
 // double instantiation); the ODE kernels install none.
 struct MirHooks {
@@ -78,8 +83,12 @@ struct MirHooks {
   // outside the interpreter's environment.
   std::function<bool(const std::string&, long*)> int_var;
   // First shot at any StanLib call the host owns (RNG draws, which carry
-  // state the pure interpreter must not). Return true when handled.
-  std::function<bool(const mir::Expr&, DataMap::Entry*)> fun;
+  // state the pure interpreter must not). Return true when handled. The
+  // interpreter making the call is passed in: a user-function body runs in
+  // a sub-interpreter that inherits these hooks, and the call's arguments
+  // live in that body's scope, not in whichever instance installed the hook.
+  std::function<bool(MirInterp<double>&, const mir::Expr&, DataMap::Entry*)>
+      fun;
   // First shot at any statement (FnReadParam and FnWriteParam in the
   // interpreted write_array). Return true when handled.
   std::function<bool(const mir::Stmt&)> stmt;
@@ -92,7 +101,9 @@ class MirInterp {
 
   MirInterp(const std::map<std::string, const mir::FunDef*>& funs,
             std::string where, MirHooks hooks = {})
-      : funs_(funs), where_(std::move(where)), hooks_(std::move(hooks)) {}
+      : funs_(funs), where_(std::move(where)), hooks_(std::move(hooks)) {
+    record_interpreter_event(where_, "construction");
+  }
 
   std::map<std::string, Value>& env() { return env_; }
 
@@ -109,11 +120,22 @@ class MirInterp {
     return it == env_.end() ? nullptr : &it->second;
   }
 
+  void set_probe(bool on) {
+    probe_ = on;
+    probe_failed_ = false;
+  }
+  bool probe_failed() const { return probe_failed_; }
+  void clear_probe_failed() const { probe_failed_ = false; }
+
   // Evaluate and coerce to a compile-time integer.
   long as_int(const mir::Expr& e) {
     Value v = eval(e);
     if (v.is_int && v.i.size() == 1) return v.i[0];
     if (v.r.size() == 1) return (long)val(v.r[0]);
+    if (probe_) {
+      probe_failed_ = true;
+      return 0;
+    }
     fail("expected int scalar", e.raw);
   }
 
@@ -202,6 +224,10 @@ class MirInterp {
           r.is_int = true;
           r.i = {(int)iv};
           r.r = {T((double)iv)};
+          return r;
+        }
+        if (probe_) {
+          probe_failed_ = true;
           return r;
         }
         fail("unknown variable " + e.name + " (type " + e.type_ + ")", e.raw);
@@ -417,6 +443,11 @@ class MirInterp {
         }
         if (st.lhs_idx.size() == 1 && st.lhs_idx[0].name == "IndexSingle") {
           const long ix = as_int(st.lhs_idx[0].args[0]);
+          const int64_t extent = en->dims.empty()
+                                     ? static_cast<int64_t>(en->r.size())
+                                     : en->dims.front();
+          if (ix < 1 || ix > extent)
+            fail("indexed assignment index out of bounds", st.raw);
           if (en->dims.size() == 2) {
             // Row write into a matrix (A[i] = row_vector), col-major strided.
             const int64_t R = en->dims[0], C = en->dims[1];
@@ -424,14 +455,9 @@ class MirInterp {
             for (int64_t j = 0; j < C; ++j) en->r.at(j * R + (ix - 1)) = v.r[j];
             return;
           }
-          if ((size_t)ix > en->r.size())
-            en->r.resize(ix, en->is_int
-                                 ? T(0.0)
-                                 : T(std::numeric_limits<double>::quiet_NaN()));
-          en->r[ix - 1] = v.r.at(0);
+          en->r.at(ix - 1) = v.r.at(0);
           if (en->is_int) {
-            if ((size_t)ix > en->i.size()) en->i.resize(ix, 0);
-            en->i[ix - 1] =
+            en->i.at(ix - 1) =
                 v.is_int && !v.i.empty() ? v.i[0] : (int)val(v.r.at(0));
           }
           return;
@@ -517,8 +543,12 @@ class MirInterp {
         }
       }
       case mir::Stmt::For: {
-        const long lo = as_int(st.lower), hi = as_int(st.upper);
-        for (long v = lo; v <= hi; ++v) {
+        const long lo = as_int(st.lower);
+        // Match stanc's C++ for condition, including upper-bound effects on
+        // the final failed test. Only the lower bound is evaluated once.
+        // `long` is only 32-bit on Windows. A Stan loop ending at INT_MAX
+        // must advance once more to fail its final condition without wrapping.
+        for (int64_t v = lo; v <= as_int(st.upper); ++v) {
           Value lv;
           lv.is_int = true;
           lv.i = {(int)v};
@@ -837,7 +867,11 @@ class MirInterp {
             ? mir::pow_zero_base_law(e.args[0], e.args[1], !e.args[1].data_only)
             : 0;
     Value o;
-    o.r = run_kernel_call(e, spec.opcode, variant, activity, {},
+    std::vector<int> idata;
+    if (layout.groups >= 0)
+      idata = {static_cast<int>(layout.groups),
+               static_cast<int>(layout.group_width), 1};
+    o.r = run_kernel_call(e, spec.opcode, variant, activity, std::move(idata),
                           std::move(inputs), layout.lanes);
     if (spec.shape == BuiltinShapePolicy::Reduction) return o;
     o.dims = values[layout.result_argument].dims;
@@ -1033,6 +1067,8 @@ class MirInterp {
   std::map<std::string, std::vector<int64_t>> decl_dims_;
   int udf_depth_ = 0;
   bool propto_ctx_ = true;
+  bool probe_ = false;
+  mutable bool probe_failed_ = false;
 
   [[noreturn]] void fail(const std::string& msg,
                          const std::string& raw = "") const {
@@ -1044,10 +1080,15 @@ class MirInterp {
   // std::out_of_range("vector"); check first so an out-of-range index
   // names the index and the extent instead.
   void bounds(long i, int64_t n, const mir::Expr& e) const {
-    if (i < 1 || i > n)
+    if (i < 1 || i > n) {
+      if (probe_) {
+        probe_failed_ = true;
+        return;
+      }
       fail("index " + std::to_string(i) + " out of bounds for size " +
                std::to_string(n),
            e.raw);
+    }
   }
 
   static double val(const T& x) { return stan::math::value_of(x); }
@@ -1372,6 +1413,7 @@ class MirInterp {
         base.dims.size() <= 1) {
       const long ix = as_int(e.args[1].args[0]);
       bounds(ix, (int64_t)base.r.size(), e);
+      if (probe_failed_) return r;
       r.is_int = base.is_int;
       if (base.is_int) r.i = {base.i.at(ix - 1)};
       r.r = {base.r.at(ix - 1)};
@@ -1386,6 +1428,7 @@ class MirInterp {
       const long i = as_int(e.args[1].args[0]);
       const int64_t R = base.dims[0], C = base.dims[1];
       bounds(i, R, e);
+      if (probe_failed_) return r;
       r.is_int = base.is_int;
       r.dims = {C};
       for (int64_t j = 0; j < C; ++j) {
@@ -1405,6 +1448,7 @@ class MirInterp {
         for (size_t d = 0; d < base.dims.size(); ++d) {
           const long ixd = as_int(e.args[1 + d].args[0]);
           bounds(ixd, base.dims[d], e);
+          if (probe_failed_) return r;
           flatpos += (ixd - 1) * stride;
           stride *= base.dims[d];
         }
@@ -1420,6 +1464,7 @@ class MirInterp {
       const long j = as_int(e.args[2].args[0]);
       const int64_t R = base.dims[0];
       bounds(j, base.dims[1], e);
+      if (probe_failed_) return r;
       r.is_int = base.is_int;
       r.dims = {R};
       r.r.assign(base.r.begin() + (j - 1) * R, base.r.begin() + j * R);
@@ -1442,6 +1487,7 @@ class MirInterp {
         for (size_t d = 0; d < n_indices; ++d) {
           const long i = as_int(e.args[1 + d].args[0]);
           bounds(i, base.dims[d], e);
+          if (probe_failed_) return r;
           offset += (i - 1) * prefix_stride;
           prefix_stride *= base.dims[d];
         }
@@ -1467,6 +1513,7 @@ class MirInterp {
       for (size_t k = 0; k < n; ++k) {
         const long p = k < ix.i.size() ? ix.i[k] : (long)val(ix.r.at(k));
         bounds(p, (int64_t)base.r.size(), e);
+        if (probe_failed_) return r;
         r.r.push_back(base.r.at((size_t)(p - 1)));
         if (base.is_int) r.i.push_back(base.i.at((size_t)(p - 1)));
       }
@@ -1479,7 +1526,9 @@ class MirInterp {
       const long b = as_int(e.args[1].args[1]);
       if (b >= a) {
         bounds(a, (int64_t)base.r.size(), e);
+        if (probe_failed_) return r;
         bounds(b, (int64_t)base.r.size(), e);
+        if (probe_failed_) return r;
       }
       r.is_int = base.is_int;
       r.dims = {b >= a ? b - a + 1 : 0};  // b < a is an empty range
@@ -1497,9 +1546,12 @@ class MirInterp {
       const long b = as_int(e.args[2].args[1]);
       const int64_t R = base.dims[0];
       bounds(i, R, e);
+      if (probe_failed_) return r;
       if (b >= a) {
         bounds(a, base.dims[1], e);
+        if (probe_failed_) return r;
         bounds(b, base.dims[1], e);
+        if (probe_failed_) return r;
       }
       r.is_int = base.is_int;
       r.dims = {b >= a ? b - a + 1 : 0};  // b < a is an empty range
@@ -1517,9 +1569,12 @@ class MirInterp {
       const long j = as_int(e.args[2].args[0]);
       const int64_t R = base.dims[0];
       bounds(j, base.dims[1], e);
+      if (probe_failed_) return r;
       if (b >= a) {
         bounds(a, R, e);
+        if (probe_failed_) return r;
         bounds(b, R, e);
+        if (probe_failed_) return r;
       }
       r.is_int = base.is_int;
       r.dims = {b >= a ? b - a + 1 : 0};  // b < a is an empty range
@@ -1545,6 +1600,7 @@ class MirInterp {
         if (index.name == "IndexSingle") {
           const long i = as_int(index.args[0]);
           bounds(i, extent, e);
+          if (probe_failed_) return r;
           selected[d].push_back(i - 1);
           drops[d] = true;
         } else if (index.name == "IndexAll") {
@@ -1559,6 +1615,7 @@ class MirInterp {
                                ? positions.i[k]
                                : static_cast<long>(val(positions.r.at(k)));
             bounds(i, extent, e);
+            if (probe_failed_) return r;
             selected[d].push_back(i - 1);
           }
         } else if (index.name == "IndexBetween") {
@@ -1566,13 +1623,16 @@ class MirInterp {
           const long hi = as_int(index.args[1]);
           if (hi >= lo) {
             bounds(lo, extent, e);
+            if (probe_failed_) return r;
             bounds(hi, extent, e);
+            if (probe_failed_) return r;
           }
           selected[d].reserve(static_cast<size_t>(hi >= lo ? hi - lo + 1 : 0));
           for (long i = lo; i <= hi; ++i) selected[d].push_back(i - 1);
         } else if (index.name == "IndexUpfrom") {
           const long lo = as_int(index.args[0]);
           bounds(lo, extent, e);
+          if (probe_failed_) return r;
           selected[d].reserve(static_cast<size_t>(extent - lo + 1));
           for (long i = lo; i <= extent; ++i) selected[d].push_back(i - 1);
         } else {
@@ -2177,6 +2237,37 @@ class MirInterp {
         r.r = {T((double)total)};
         return r;
       }
+      if constexpr (std::is_same_v<T, double>) {
+        const mir::Expr& operand = e.args[0];
+        if (mir::eigen_leaf(operand) && operand.unsized.depth == 0) {
+          ExpressionLayout layout = mir::source_expression_layout(operand);
+          const mir::Expr* base = &operand;
+          if (base->kind == mir::Expr::Indexed && !base->args.empty() &&
+              base->args[0].unsized.depth > 0)
+            base = &base->args[0];
+          CallableTransformSpec transform;
+          if (base->kind == mir::Expr::FunApp &&
+              callable_transform(base->name, &transform))
+            layout = ExpressionLayout::direct();
+          if (layout.packet_access()) {
+            if (a.r.empty())
+              r.r = {0.0};
+            else if (layout.direct_access() && layout.element_offset != 0)
+              r.r = {reduce_phased(a.r.data(), (int64_t)a.r.size(),
+                                   layout.element_offset,
+                                   Eigen::internal::scalar_sum_op<double>())};
+            else {
+              const Eigen::Map<const Eigen::VectorXd> input(a.r.data(),
+                                                            a.r.size());
+              r.r = {input
+                         .unaryExpr(
+                             Eigen::internal::core_cast_op<double, double>())
+                         .sum()};
+            }
+            return r;
+          }
+        }
+      }
       const BuiltinSpec* reduction = reduction_builtin_spec(e.name, 1);
       if (reduction == nullptr)
         fail("sum: missing reduction descriptor", e.raw);
@@ -2740,7 +2831,7 @@ class MirInterp {
       return r;
     }
     if constexpr (std::is_same_v<T, double>) {
-      if (hooks_.fun && hooks_.fun(e, &r)) return r;
+      if (hooks_.fun && hooks_.fun(*this, e, &r)) return r;
     }
     fail("unsupported function " + e.name, e.raw);
   }

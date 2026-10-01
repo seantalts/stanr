@@ -290,12 +290,20 @@ long Lowering::eval_int(const mir::Expr& e) {
       if (scalar_shape_query(e) && e.args.size() == 1 &&
           e.args[0].kind == mir::Expr::Var) {
         auto sit = scope.find(e.args[0].name);
-        if (sit != scope.end() && !has_runtime_shape(sit->second))
+        if (sit != scope.end()) {
+          if (has_runtime_shape(sit->second))
+            fail(e.name + ": operand has no compile-time extent", e.raw);
           return answer_shape_query(e, sit->second.si,
                                     g.slots[sit->second.slot].len);
+        }
         auto dl = decls.find(e.args[0].name);
-        if (dl != decls.end())
+        if (dl != decls.end()) {
+          if (std::any_of(dl->second.runtime_dims.begin(),
+                          dl->second.runtime_dims.end(),
+                          [](int slot) { return slot >= 0; }))
+            fail(e.name + ": operand has no compile-time extent", e.raw);
           return answer_shape_query(e, dl->second.si, dl->second.len);
+        }
         // A name td knows but neither scope nor decls does: the scalar
         // `int` input. bind_data fills both tables from a declared shape
         // and a scalar int has none, so it falls past both -- the one
@@ -1312,7 +1320,10 @@ Lowering::Val Lowering::emit_value(uint16_t opcode,
     if (!has_runtime_shape(in) && g.slots[in.slot].len != 1)
       fail(std::string(opcode_name(opcode)) +
            ": a full-extent operand beside a runtime-length one");
-  const bool elementwise = out_len == op.dyn_capacity;
+  // A sum stays scalar even when its input capacity is one.
+  // Matching storage counts alone would give sum(vector[0:1]) a changing
+  // output shape and incorrectly reject its scalar assignment.
+  const bool elementwise = out_len == op.dyn_capacity && opcode != OP_SUM_VEC;
   if ((out_len != 1 && !elementwise) || out2 >= 0 || !idata.empty() ||
       is_matrix(out_si))
     fail(std::string(opcode_name(opcode)) +
@@ -1331,6 +1342,24 @@ Lowering::Val Lowering::emit_value(uint16_t opcode,
 std::optional<DataMap::Entry> Lowering::try_eval_interpreter(
     const mir::Expr& e) {
   if (expr_effectful(e)) return std::nullopt;
+  // Unknown variables are an ordinary answer to a speculative probe, not
+  // an interpreter error. Check only eagerly evaluated operands: a missing
+  // name in a dead logical/conditional arm must not prevent constant folding.
+  // Higher-order and compiler-internal calls own their argument evaluation.
+  const auto missing_input = [&](const auto& self, const mir::Expr& x) -> bool {
+    if (x.kind == mir::Expr::Var)
+      return !td.env().count(x.name) && !int_env.count(x.name);
+    if (x.kind == mir::Expr::EAnd || x.kind == mir::Expr::EOr ||
+        x.kind == mir::Expr::TernaryIf)
+      return !x.args.empty() && self(self, x.args[0]);
+    if (x.kind == mir::Expr::FunApp &&
+        (x.fn_lib == mir::Expr::Lib::Internal || mir::higher_order_call(x)))
+      return false;
+    for (const auto& arg : x.args)
+      if (self(self, arg)) return true;
+    return false;
+  };
+  if (missing_input(missing_input, e)) return std::nullopt;
   if (region_current) {
     // A pure user function can still contain a huge loop. Do not execute
     // it as a speculative control/shape probe inside a retained body.
@@ -1345,6 +1374,7 @@ std::optional<DataMap::Entry> Lowering::try_eval_interpreter(
     if (calls_user(e)) return std::nullopt;
   }
   try {
+    record_interpreter_event("lowering", "folding_probe");
     return td.eval(e);
   } catch (const CompileError&) {
     return std::nullopt;
@@ -1426,15 +1456,25 @@ Lowering::StaticProbe<Lowering::StaticView> Lowering::try_static_view(
     const mir::Expr& e) {
   if (e.kind == mir::Expr::Var) {
     auto value = scope.find(e.name);
-    if (value != scope.end())
+    if (value != scope.end()) {
+      // Allocated capacity is not the logical shape of a retained local.
+      // Returning it here would freeze size(a), including loop bounds, at
+      // the maximum extent even when this evaluation uses fewer elements.
+      if (has_runtime_shape(value->second)) return {};
       return {StaticProbeState::Known,
               {g.slots[value->second.slot].len, value->second.si},
               {}};
+    }
     auto declaration = decls.find(e.name);
-    if (declaration != decls.end())
+    if (declaration != decls.end()) {
+      if (std::any_of(declaration->second.runtime_dims.begin(),
+                      declaration->second.runtime_dims.end(),
+                      [](int slot) { return slot >= 0; }))
+        return {};
       return {StaticProbeState::Known,
               {declaration->second.len, declaration->second.si},
               {}};
+    }
     return {};
   }
   if (e.kind == mir::Expr::Promotion && e.args.size() == 1)

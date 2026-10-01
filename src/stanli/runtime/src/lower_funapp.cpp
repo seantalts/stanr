@@ -26,10 +26,13 @@ Lowering::BuiltinDispatch Lowering::resolve_builtin(const mir::Expr& e) {
   static const std::unordered_map<std::string_view, BuiltinDispatch> kBuiltins =
       {
           {"multi_normal_rng", BuiltinFamily::MultiNormalRng},
+          {"multi_normal_cholesky_rng", BuiltinFamily::MultiNormalRng},
           {"dirichlet_rng", BuiltinFamily::DirichletRng},
           {"categorical_rng", BuiltinFamily::CategoricalRng},
+          {"poisson_binomial_rng", BuiltinFamily::CategoricalRng},
           {"categorical_logit_rng", BuiltinFamily::CategoricalRng},
           {"append_array", BuiltinFamily::AppendArray},
+          {"Modulo__", BuiltinFamily::Elementwise},
           {"tcrossprod", BuiltinFamily::Matrix},
           {"diag_pre_multiply", BuiltinFamily::Matrix},
           {"diag_post_multiply", BuiltinFamily::Matrix},
@@ -129,6 +132,7 @@ bool Lowering::fun_effectful(const std::string& name) {
   };
 
   visit_expr = [&](const mir::Expr& e) {
+    if (mir::stateful_intrinsic_kind(e)) return true;
     if (e.kind == mir::Expr::FunApp && e.name.size() >= 4 &&
         e.name.compare(e.name.size() - 4, 4, "_rng") == 0)
       return true;
@@ -149,6 +153,7 @@ bool Lowering::fun_effectful(const std::string& name) {
   };
 
   visit_stmt = [&](const mir::Stmt& s) {
+    if (s.kind == mir::Stmt::TargetPE) return true;
     if (s.kind == mir::Stmt::NRFunApp && message_action(s.fn_name)) return true;
     for (const auto& e : s.fn_args)
       if (visit_expr(e)) return true;
@@ -177,7 +182,8 @@ std::vector<int> Lowering::int_arg_values(LoweredArgument& actual) {
     if (int_env.count(oc.name)) return {static_cast<int>(int_env[oc.name])};
   }
   if (oc.kind == mir::Expr::LitInt) return {static_cast<int>(oc.lit_i)};
-  if (oc.kind == mir::Expr::Indexed) {
+  if (oc.kind == mir::Expr::Indexed ||
+      (oc.kind == mir::Expr::FunApp && oc.unsized.depth > 0)) {
     // May be a slice (y[i] on a 2-D array yields a whole row), so
     // evaluate through the data interpreter, not scalar eval_int.
     DataMap::Entry v = eval_pure(oc, "an integer density argument");
@@ -395,21 +401,15 @@ Lowering::Val Lowering::free_transform(uint16_t opcode,
 // in the caller's scope, bound under the parameter names in a shadowed
 // scope, and the body lowers like any other statements (loops unroll,
 // data-only conditions resolve). Return throws the result value out.
-Lowering::Val Lowering::lower_call_udf(
-    const mir::Expr& e, const std::function<void()>& before_body) {
+Lowering::Val Lowering::lower_call_udf(const mir::Expr& e,
+                                       const std::function<void()>& before_body,
+                                       const UdfSpecialization& specialize) {
   auto it = fun_defs.find(e.name);
   if (it == fun_defs.end()) fail("unknown function " + e.name, e.raw);
   const mir::FunDef& f = *it->second;
   CallArguments actuals(*this, e);
   actuals.require_arity(f.arg_names.size());
-  struct Binding {
-    bool is_int = false;
-    long iv = 0;
-    Val v{-1, false, {}};
-    std::optional<DataMap::Entry> data;
-    bool formal_data_only = false;
-  };
-  std::vector<Binding> binds(actuals.size());
+  std::vector<UdfBinding> binds(actuals.size());
   for (size_t i = 0; i < actuals.size(); ++i) {
     LoweredArgument& actual = actuals.at(i);
     const mir::Expr& a = actual.expr();
@@ -434,6 +434,8 @@ Lowering::Val Lowering::lower_call_udf(
   // Higher-order calls may validate after evaluating all actual arguments
   // but before entering the user body (reduce_sum's grainsize check).
   if (before_body) before_body();
+  if (specialize)
+    if (auto result = specialize(binds)) return *result;
   if (++udf_depth > 64) {
     --udf_depth;
     fail("UDF recursion too deep in " + e.name);
@@ -450,6 +452,7 @@ Lowering::Val Lowering::lower_call_udf(
   auto decls_saved = std::move(decls);
   auto il_saved = std::move(int_locals);
   auto env_saved = std::move(td.env());
+  auto journal_saved = std::move(td_journal);
   scope.clear();
   udf_formal_autodiff.clear();
   int_env.clear();
@@ -479,6 +482,7 @@ Lowering::Val Lowering::lower_call_udf(
     decls = std::move(decls_saved);
     int_locals = std::move(il_saved);
     td.env() = std::move(env_saved);
+    td_journal = std::move(journal_saved);
     --udf_depth;
   };
   try {
@@ -549,7 +553,9 @@ Lowering::Val Lowering::lower_multi_normal_rng(const mir::Expr& e,
   Val draw = with_layout(emit_value(OP_RNG, {location, covariance}, k,
                                     view_of(e.type_), {static_cast<int>(k)}),
                          ExpressionLayout::direct());
-  g.ops.back().variant = kMultiNormalRngVariant;
+  g.ops.back().variant = e.name == "multi_normal_cholesky_rng"
+                             ? kMultiNormalCholeskyRngVariant
+                             : kMultiNormalRngVariant;
   draw.si.param_free = false;
   draw.autodiff = false;
   return draw;
@@ -611,8 +617,10 @@ Lowering::Val Lowering::lower_categorical_rng(const mir::Expr& e,
   const bool is_logit = e.name == "categorical_logit_rng";
   if (!in_write_array)
     fail(e.name + " is supported only in generated quantities", e.raw);
-  if (e.args.size() != 1 || e.type_ != "UInt" ||
-      e.unsized.leaf != mir::UnsizedLeaf::Int || e.unsized.depth != 0)
+  const bool promoted_int =
+      e.promoted && e.unsized.leaf == mir::UnsizedLeaf::Real;
+  if (e.args.size() != 1 || e.unsized.depth != 0 ||
+      (e.unsized.leaf != mir::UnsizedLeaf::Int && !promoted_int))
     fail(e.name + ": expected one scalar int result", e.raw);
   const mir::Expr& probabilities = actuals.at(0).expr();
   if (probabilities.type_ != "UVector" || probabilities.unsized.depth != 0 ||
@@ -624,15 +632,14 @@ Lowering::Val Lowering::lower_categorical_rng(const mir::Expr& e,
   Val argument = actuals.at(0).value();
   if (!is_vector(argument.si))
     fail(e.name + ": argument is not a logical vector", e.raw);
-  if (is_logit)
-    argument =
-        lower_regular_unary(OP_SOFTMAX, "UVector", "softmax", e.raw, argument);
   Val draw = with_layout(emit_value(OP_RNG, {argument}, 1, view_of(e.type_)),
                          ExpressionLayout::scalar());
-  g.ops.back().variant = kCategoricalRngVariant;
-  // A successful call returns a Stan int, but deliberately do not widen
-  // this tranche into runtime-sum range reasoning. Survey only needs the
-  // scalar value; dynamic integer control and indexing still fail closed.
+  g.ops.back().variant = is_logit ? kCategoricalLogitRngVariant
+                         : e.name == "poisson_binomial_rng"
+                             ? kPoissonBinomialRngVariant
+                             : kCategoricalRngVariant;
+  // Successful calls return initialized Stan integers. Their values remain
+  // runtime effects; no compile-time range or extent may be inferred here.
   draw.si.param_free = false;
   draw.autodiff = false;
   set_int_initialized(draw);
@@ -644,14 +651,15 @@ Lowering::Val Lowering::lower_scalar_rng(const mir::Expr& e,
   if (!in_write_array)
     fail(e.name + " is supported only in generated quantities", e.raw);
   const size_t arity = scalar_rng_arity(family);
-  if (actuals.size() != arity || e.unsized.depth != 0)
-    fail(e.name + ": expected scalar result and " + std::to_string(arity) +
-             " scalar argument(s)",
+  if (actuals.size() != arity || e.unsized.depth > 1)
+    fail(e.name + ": expected " + std::to_string(arity) + " argument(s)",
          e.raw);
   const mir::UnsizedLeaf result_leaf = scalar_rng_is_int(family)
                                            ? mir::UnsizedLeaf::Int
                                            : mir::UnsizedLeaf::Real;
-  if (e.unsized.leaf != result_leaf)
+  const bool promoted_int = scalar_rng_is_int(family) && e.promoted &&
+                            e.unsized.leaf == mir::UnsizedLeaf::Real;
+  if (e.unsized.leaf != result_leaf && !promoted_int)
     fail(e.name + ": result type does not match RNG family", e.raw);
   // Unlike the other scalar families, binomial's (and beta_binomial's)
   // first argument is a population count. Valid stanc MIR always marks it
@@ -662,28 +670,58 @@ Lowering::Val Lowering::lower_scalar_rng(const mir::Expr& e,
     fail(e.name + ": first argument must be int", e.raw);
   std::vector<Val> args;
   args.reserve(arity);
+  int64_t n = 1;
+  int container_mask = 0;
   for (size_t i = 0; i < actuals.size(); ++i) {
     const mir::Expr& arg = actuals.at(i).expr();
-    if (arg.unsized.depth != 0)
-      fail(e.name + ": container arguments stay on WaInterp", e.raw);
-    args.push_back(actuals.at(i).value());
-    if (!is_scalar(args.back()))
-      fail(e.name + ": container arguments stay on WaInterp", e.raw);
+    const bool scalar =
+        arg.unsized.depth == 0 && (arg.unsized.leaf == mir::UnsizedLeaf::Real ||
+                                   arg.unsized.leaf == mir::UnsizedLeaf::Int);
+    const bool array =
+        arg.unsized.depth == 1 && (arg.unsized.leaf == mir::UnsizedLeaf::Real ||
+                                   arg.unsized.leaf == mir::UnsizedLeaf::Int);
+    if (!scalar && !array &&
+        !(arg.unsized.depth == 0 &&
+          (arg.unsized.leaf == mir::UnsizedLeaf::Vector ||
+           arg.unsized.leaf == mir::UnsizedLeaf::RowVector)))
+      fail(e.name + ": expected scalar or one-dimensional arguments", e.raw);
+    Val v = actuals.at(i).value();
+    if (has_runtime_shape(v))
+      fail(e.name + ": RNG arguments need fixed extents", e.raw);
+    args.push_back(v);
+    const int64_t len = g.slots[v.slot].len;
+    if (scalar) {
+      if (!is_scalar(v)) fail(e.name + ": expected scalar storage", e.raw);
+    } else {
+      if (container_mask != 0 && len != n)
+        fail(e.name + ": argument lengths disagree", e.raw);
+      n = len;
+      container_mask |= 1 << i;
+    }
   }
+  if ((e.unsized.depth == 1) != (container_mask != 0))
+    fail(e.name + ": result shape does not match RNG arguments", e.raw);
+  // One vectorized call validates complete arguments before drawing. Scalar
+  // calls retain their original no-metadata path.
+  const char* const scalar_type = scalar_rng_is_int(family) ? "UInt" : "UReal";
+  const auto si = container_mask != 0 ? array_view({n}, ViewKind::Flat, false)
+                                      : view_of(scalar_type);
+  const std::vector<int> idata = container_mask != 0
+                                     ? std::vector<int>{container_mask}
+                                     : std::vector<int>{};
   Val draw = with_layout(
-      arity == 1   ? emit_value(OP_RNG, {args[0]}, 1, view_of(e.type_))
-      : arity == 2 ? emit_value(OP_RNG, {args[0], args[1]}, 1, view_of(e.type_))
-                   : emit_value(OP_RNG, {args[0], args[1], args[2]}, 1,
-                                view_of(e.type_)),
-      ExpressionLayout::scalar());
+      arity == 0   ? emit_value(OP_RNG, {}, n, si, idata)
+      : arity == 1 ? emit_value(OP_RNG, {args[0]}, n, si, idata)
+      : arity == 2
+          ? emit_value(OP_RNG, {args[0], args[1]}, n, si, idata)
+          : emit_value(OP_RNG, {args[0], args[1], args[2]}, n, si, idata),
+      owning_layout(si));
   g.ops.back().variant = static_cast<uint8_t>(family);
-  // An effect is never a graph constant, even when all distribution
-  // parameters are. This also keeps downstream compile-time demands from
-  // mistaking a draw for data.
   draw.si.param_free = false;
   draw.autodiff = false;
   if (scalar_rng_is_int(family)) set_int_initialized(draw);
-  if (family == ScalarRng::Bernoulli) set_int_range(draw, 0, 1);
+  if (family == ScalarRng::Bernoulli || family == ScalarRng::BernoulliLogit)
+    set_int_range(draw, 0, 1);
   return draw;
 }
 Lowering::Val Lowering::lower_append_array(const mir::Expr& e,
@@ -843,6 +881,32 @@ Lowering::Val Lowering::lower_funapp(const mir::Expr& e) {
       }
       acc.si = array_view(std::move(dims), leaf, acc.si.param_free);
     }
+    if (e.name == "FnMakeArray" && e.unsized.leaf == mir::UnsizedLeaf::Int) {
+      bool initialized = true, bounded = !parts.empty();
+      IntRange range{std::numeric_limits<int32_t>::max(),
+                     std::numeric_limits<int32_t>::min()};
+      for (const Val& part : parts) {
+        const auto prefix = int_initialized_prefix.find(part.slot);
+        initialized = initialized && prefix != int_initialized_prefix.end() &&
+                      prefix->second == g.slots[part.slot].len;
+        const auto bounds = int_ranges.find(part.slot);
+        if (bounds == int_ranges.end()) {
+          bounded = false;
+        } else {
+          range.lo = std::min(range.lo, bounds->second.lo);
+          range.hi = std::max(range.hi, bounds->second.hi);
+        }
+      }
+      // Concatenation preserves integer values. Carry the proof only when
+      // every child supplies it; an uninitialized or unbounded child must
+      // still prevent the guarded integer reduction from compiling.
+      if (initialized) {
+        if (bounded)
+          set_int_range(acc, range.lo, range.hi);
+        else
+          set_int_initialized(acc);
+      }
+    }
     if (acc.si.param_free) {
       // MirInterp's scalar-vs-container probe reads child[0], which is not
       // defined for an explicit array of zero-width containers. The view
@@ -936,11 +1000,21 @@ Lowering::Val Lowering::lower_funapp(const mir::Expr& e) {
     if (has_runtime_shape(a) &&
         (e.name == "size" || e.name == "num_elements" || e.name == "rows" ||
          e.name == "cols" || e.name == "FnLength")) {
-      if (e.name == "num_elements" && a.runtime_dims.size() != 1)
-        fail("num_elements: a runtime view of this rank has no single extent",
-             e.raw);
-      const size_t axis = e.name == "cols" ? 1 : 0;
-      if (axis < a.runtime_dims.size() && a.runtime_dims[axis] >= 0) {
+      if (e.name == "num_elements" && a.runtime_dims.size() != 1) {
+        const auto width = bounded_outer_width(a);
+        const auto range = region_range(e);
+        if (!width || !range)
+          fail("num_elements: runtime array needs bounded fixed inner extents",
+               e.raw);
+        Val extent{a.runtime_dims[0], false, view_of("UInt")};
+        extent.si.param_free = true;
+        Val count = emit_value(OP_MUL, {extent, constant(double(*width))}, 1);
+        set_int_range(count, range->lo, range->hi);
+        return count;
+      }
+      const int axis = runtime_shape_axis(a, e.name);
+      if (axis < 0) return constant(1);
+      if (size_t(axis) < a.runtime_dims.size() && a.runtime_dims[axis] >= 0) {
         Val extent{a.runtime_dims[axis], false, view_of("UInt")};
         extent.si.param_free = true;
         return with_layout(extent, ExpressionLayout::scalar());
@@ -1065,13 +1139,25 @@ std::optional<Lowering::Val> Lowering::lower_density_fn(
 // Elementwise math, reductions, and dot products.
 std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
     const mir::Expr& e, CallArguments& actuals, const BuiltinSpec* builtin) {
-  // Once a generated int RNG has become a runtime scalar slot, named
-  // integer division is no longer foldable. OP_DIV is real division and
-  // would return 3.5 for divide(7, 2), while Stan truncates to 3. Refuse it
-  // so the whole write_array stays on WaInterp until there is a native int
-  // division op. The operator spelling is IntDivide__ and already refuses.
+  // The register engine already implements Stan's integer division and
+  // remainder, including zero-divisor errors. Preserve the selected integer
+  // overload even when its result is subsequently promoted to real.
+  if (write_array_unregioned() &&
+      ((builtin && builtin->result == FunctionArgumentKind::Integer &&
+        builtin->opcode == OP_DIV) ||
+       (e.name == "Modulo__" && e.args.size() == 2 &&
+        std::all_of(e.args.begin(), e.args.end(), [](const mir::Expr& arg) {
+          return arg.unsized.leaf == mir::UnsizedLeaf::Int &&
+                 arg.unsized.depth == 0;
+        })))) {
+    Val result = lower_program_expression(e);
+    result.si.param_free = false;
+    result.autodiff = false;
+    set_int_initialized(result);
+    return result;
+  }
   if ((e.name == "divide" || e.name == "elt_divide") && e.type_ == "UInt")
-    fail(e.name + ": runtime integer division stays on WaInterp", e.raw);
+    fail(e.name + ": integer division needs a register expression", e.raw);
   // `A \ B` and `B / A` with a matrix divisor are linear solves, not
   // elementwise division: stanc spells them with the ordinary division
   // operators and lowers them to mdivide_left/mdivide_right. The divisor's
@@ -1203,6 +1289,19 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
   // their own policy dispatch further down.
   const bool elementwise_builtin =
       builtin != nullptr && builtin->shape == BuiltinShapePolicy::Elementwise;
+  if (elementwise_builtin && builtin->arity == 4) {
+    actuals.require_arity(4);
+    Val a = actuals.at(0).value(), b = actuals.at(1).value();
+    Val c = actuals.at(2).value(), d = actuals.at(3).value();
+    const std::vector<Val> values{a, b, c, d};
+    const auto layout = resolved_builtin_layout(e, *builtin, values);
+    SlotInfo si = view_of(e.type_);
+    si.param_free = a.si.param_free && b.si.param_free && c.si.param_free &&
+                    d.si.param_free;
+    return with_layout(
+        emit_value(builtin->opcode, {a, b, c, d}, layout.lanes, si),
+        elementwise_layout({a, b, c, d}));
+  }
   if (elementwise_builtin && builtin->arity == 2 &&
       builtin->arguments[0] == BuiltinArgumentKind::Real &&
       builtin->arguments[1] == BuiltinArgumentKind::Real) {
@@ -1213,10 +1312,60 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
     const BuiltinLayout layout = resolved_builtin_layout(e, *builtin, values);
     SlotInfo si = values[layout.result_argument].si;
     si.param_free = a.si.param_free && b.si.param_free;
+    if (builtin->opcode == OP_ADD && !in_write_array && a.autodiff &&
+        is_matrix(a.si) && a.si.rows == a.si.cols && !g.ops.empty()) {
+      const Op& previous = g.ops.back();
+      const bool right = previous.out == b.slot && previous.in[0] == a.slot;
+      const bool left = previous.out == a.slot && previous.in[0] == b.slot;
+      if (previous.opcode == OP_TRANSPOSE && previous.n_in == 1 &&
+          (right || left)) {
+        Val result = emit_value(OP_ADD, {a, b}, layout.lanes, si,
+                                {checked_immediate(a.si.rows, "matrix add")});
+        g.ops.back().variant = right ? kAddTransposeRight : kAddTransposeLeft;
+        return with_layout(result, elementwise_layout({a, b}));
+      }
+    }
+    // Stan's scalar pow(var, data) overload dispatches these exponents to
+    // the corresponding unary function. Preserve that arithmetic (and its
+    // derivative grouping) before an island or reroll can erase the static
+    // argument types. This is overload selection, not an algebraic rewrite.
+    if (builtin->opcode == OP_POW && a.autodiff && !b.autodiff &&
+        mir::language_scalar(e.args[0]) && mir::language_scalar(e.args[1])) {
+      if (const auto* exponent = observation(b);
+          exponent && exponent->r.size() == 1) {
+        const double power = exponent->r[0];
+        if (power == 1.0) return a;
+        const uint16_t unary = power == 0.5    ? OP_SQRT
+                               : power == 2.0  ? OP_SQUARE
+                               : power == -2.0 ? OP_INV_SQUARE
+                               : power == -1.0 ? OP_INV
+                               : power == -0.5 ? OP_INV_SQRT
+                                               : OP_NONE_;
+        if (unary != OP_NONE_)
+          return with_layout(emit_value(unary, {a}, layout.lanes, si),
+                             elementwise_layout({a}));
+      }
+    }
     Val v = emit_value(builtin->opcode, {a, b}, layout.lanes, si);
-    if (builtin->opcode == OP_POW)
+    if (builtin->opcode == OP_POW) {
       g.ops.back().variant =
           mir::pow_zero_base_law(e.args[0], e.args[1], b.autodiff);
+    } else if (builtin->opcode == OP_DIV && e.args[0].unsized.depth == 0 &&
+               mir::eigen_leaf(e.args[0]) && mir::language_scalar(e.args[1])) {
+      g.ops.back().variant = kDivMatrixScalar |
+                             (a.autodiff ? kDivMatrixActive : 0) |
+                             (b.autodiff ? kDivScalarActive : 0);
+    } else if (builtin->opcode == OP_DIV && mir::language_scalar(e.args[0]) &&
+               mir::language_scalar(e.args[1])) {
+      g.ops.back().variant = kDivScalarLanes;
+    } else if (builtin->opcode == OP_FMAX || builtin->opcode == OP_FMIN) {
+      // Operand activity selects the stan-math overload: ties and NaN
+      // adjoints differ between the var,var and mixed instantiations, and
+      // the register-machine backward needs the same bits the kernel path
+      // reads from its adjoint slots.
+      g.ops.back().variant =
+          (uint8_t)((a.autodiff ? 0x1u : 0u) | (b.autodiff ? 0x2u : 0u));
+    }
     return with_layout(v, elementwise_layout({a, b}));
   }
 
@@ -1406,8 +1555,13 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
       return with_layout(emit_value(OP_DOT, {d, d}, 1),
                          ExpressionLayout::scalar());
     }
-    return with_layout(emit_value(OP_DOT, {a, b}, 1),
-                       ExpressionLayout::scalar());
+    Val result = emit_value(OP_DOT, {a, b}, 1);
+    // The Matrix<var> dot_self overload sums squares in source order and
+    // contributes (2 * seed) * x once, unlike a two-input dot product.
+    if (paired->arity == 1 && a.autodiff && !in_write_array &&
+        mir::eigen_leaf(e.args[0]))
+      g.ops.back().variant = 1;
+    return with_layout(result, ExpressionLayout::scalar());
   }
 
   // Registered grouped reductions: one dot per column or row through the
@@ -1515,22 +1669,33 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
       const bool int_surface =
           e.type_ == "UInt" || e.unsized.leaf == mir::UnsizedLeaf::Int ||
           (!e.args.empty() && e.args[0].unsized.leaf == mir::UnsizedLeaf::Int);
-      if (int_surface && in_write_array) {
-        if (runtime_int_sum_candidate(e))
+      if (int_surface && bounded_output)
+        return lower_runtime_int_sum(e, actuals);
+      if (int_surface && write_array_unregioned()) {
+        if (runtime_int_sum_candidate(e) ||
+            (is_int_sum_surface(e) && e.args[0].kind != mir::Expr::Var))
           return lower_runtime_int_sum(e, actuals);
         if (!is_int_sum_surface(e))
           fail(
               "runtime integer sum needs one one-dimensional int-array "
               "argument and a scalar int result",
               e.raw);
-        if (e.args[0].kind != mir::Expr::Var || expr_effectful(e))
-          fail("direct runtime integer sum stays on WaInterp", e.raw);
         // A param-free named array retains the legacy OP_SUM_VEC/fold path.
       }
     }
     actuals.require_arity(1);
     Val a = actuals.at(0).value();
     (void)resolved_builtin_layout(e, *reduction, std::vector<Val>{a});
+    if (reduction->opcode == OP_SUM_VEC && mir::eigen_leaf(e.args[0]) &&
+        e.args[0].unsized.depth == 0 && (!a.autodiff || in_write_array)) {
+      const ReductionGrouping grouping = reduction_grouping(a, false);
+      Val result = emit_value(OP_SUM_VEC, {a}, 1, {},
+                              reduction_phase_idata(a, grouping, "sum"));
+      g.ops.back().variant = grouping == ReductionGrouping::Packet   ? 1u
+                             : grouping == ReductionGrouping::Phased ? 2u
+                                                                     : 0u;
+      return with_layout(result, ExpressionLayout::scalar());
+    }
     return with_layout(emit_value(reduction->opcode, {a}, 1),
                        ExpressionLayout::scalar());
   }
@@ -1559,7 +1724,16 @@ std::optional<Lowering::Val> Lowering::lower_eltwise_fn(
             ? elementwise_layout({a})
             : owning_layout(si);
     return with_layout(
-        emit_value(builtin->opcode, {a}, g.slots[a.slot].len, si), layout);
+        emit_value(
+            builtin->opcode, {a}, g.slots[a.slot].len, si,
+            resolved.groups < 0
+                ? std::vector<int>{}
+                : std::vector<int>{checked_immediate(resolved.groups,
+                                                     "softmax groups"),
+                                   checked_immediate(resolved.group_width,
+                                                     "softmax width"),
+                                   0}),
+        layout);
   }
   // plus, and its operator spelling, are the identity on every shape.
   if (e.name == "PPlus__" || (e.name == "plus" && e.args.size() == 1)) {

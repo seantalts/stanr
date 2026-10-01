@@ -3,7 +3,7 @@
 # convention for bundled libraries
 set -e
 
-STANLI_REF="ff2165d"
+STANLI_REF="73a3c44a08881197353b4c40a894a17666d86d73"
 STANLI_TARBALL="stanli-$STANLI_REF.tar.gz"
 STANLI_URL="https://github.com/seantalts/stanli/archive/$STANLI_REF.tar.gz"
 

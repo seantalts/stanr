@@ -89,6 +89,7 @@ namespace stanli {
   X(OP_RNG)                           \
   X(OP_ISLAND)                        \
   X(OP_LOOP)                          \
+  X(OP_REDUCE_SUM)                    \
   X(OP_COMPARE)                       \
   X(OP_INT_ARITH)                     \
   X(OP_REP_VEC_DYNAMIC)               \
@@ -187,7 +188,10 @@ namespace stanli {
   X(OP_CROSSPROD)                     \
   X(OP_MULT_LOWER_TRI_SELF_TRANSPOSE) \
   X(OP_DAE)                           \
-  X(OP_ODE_ADJOINT)
+  X(OP_ODE_ADJOINT)                   \
+  X(OP_STUDENT_T_QF)                  \
+  X(OP_POISSON_BINOMIAL)              \
+  X(OP_HYPERGEOMETRIC_1F0)
 
 // Scalar densities, one line each: this list generates the opcode, the
 // name, the kernel, its registration, and the lowering table entry
@@ -368,7 +372,6 @@ namespace stanli {
   X(OP_LOGNORMAL_LCCDF, lognormal_lccdf, 3, 0)                             \
   X(OP_LOGNORMAL_LCDF, lognormal_lcdf, 3, 0)                               \
   X(OP_NORMAL_CDF, normal_cdf, 3, 0)                                       \
-  X(OP_NORMAL_LCCDF, normal_lccdf, 3, 0)                                   \
   X(OP_NORMAL_LCDF, normal_lcdf, 3, 0)                                     \
   X(OP_PARETO_CDF, pareto_cdf, 3, 0)                                       \
   X(OP_PARETO_LCCDF, pareto_lccdf, 3, 0)                                   \
@@ -386,7 +389,6 @@ namespace stanli {
   X(OP_SKEW_NORMAL_LCCDF, skew_normal_lccdf, 4, 0)                         \
   X(OP_SKEW_NORMAL_LCDF, skew_normal_lcdf, 4, 0)                           \
   X(OP_STD_NORMAL_CDF, std_normal_cdf, 1, 0)                               \
-  X(OP_STD_NORMAL_LCCDF, std_normal_lccdf, 1, 0)                           \
   X(OP_SKEW_DOUBLE_EXPONENTIAL_CDF, skew_double_exponential_cdf, 4, 0)     \
   X(OP_SKEW_DOUBLE_EXPONENTIAL_LCDF, skew_double_exponential_lcdf, 4, 0)   \
   X(OP_SKEW_DOUBLE_EXPONENTIAL_LCCDF, skew_double_exponential_lccdf, 4, 0) \
@@ -401,9 +403,14 @@ namespace stanli {
   X(OP_WEIBULL_LCCDF, weibull_lccdf, 3, 0)                                 \
   X(OP_WEIBULL_LCDF, weibull_lcdf, 3, 0)
 
+#define STANLI_REFLECTED_CDF_LIST(X)     \
+  X(OP_NORMAL_LCCDF, normal_lccdf, 3, 0) \
+  X(OP_STD_NORMAL_LCCDF, std_normal_lccdf, 1, 0)
+
 #define STANLI_SCALAR_CDF_LIST(X) \
   STANLI_SCALAR_CDF_LIST_A(X)     \
-  STANLI_SCALAR_CDF_LIST_B(X)
+  STANLI_SCALAR_CDF_LIST_B(X)     \
+  STANLI_REFLECTED_CDF_LIST(X)
 
 // The same, for distributions whose outcome is an integer: the count
 // rides in idata exactly as it does for the lpmfs, and the real
@@ -509,6 +516,53 @@ inline double pow_zero_base_partial(uint8_t law, double seed, double base,
                                      : -2.0 * seed / (base * base * base);
   if (exponent == -0.5) return -0.5 * seed / (base * std::sqrt(base));
   return 0.0;
+}
+
+// A source matrix divided by a scalar uses Stan's reciprocal-multiply
+// overload, even for a one-element matrix. Keep that static shape and the
+// source scalar types through lowering; lengths alone cannot recover them.
+enum DivVariant : uint8_t {
+  kDivMatrixScalar = 1,
+  kDivMatrixActive = 2,
+  kDivScalarActive = 4,
+  // Independent source scalar calls retain scalar arithmetic when rerolled.
+  kDivScalarLanes = 8,
+};
+
+// ADD of one matrix and its transpose. The two views share scalar var
+// nodes, so Stan's callback interleaves their updates coefficient by
+// coefficient. idata[0] is the square matrix width.
+enum AddVariant : uint8_t {
+  kAddTransposeRight = 1,
+  kAddTransposeLeft = 2,
+};
+
+// Which DIV reverse-mode grouping an instruction carries: a Program::Instr's
+// `len` (scalar) or a RANGE's `law` (ranged), as for PowZeroBaseLaw.
+enum DivLaw : uint8_t {
+  // -(u*a)/(b*b): stan-math's own var/var operator/, so a Program this
+  // grouping runs over stays bitwise identical to running it under
+  // stan-math autodiff instead -- the contract ode_prog.cpp's generated
+  // right-hand side needs against its own var interpreter fallback.
+  kDivReplayGrouping = 0,
+  // da=u/b; db=-out*da: the graph elementwise division kernel's grouping.
+  // Set by the island carver so a carved DIV agrees with the graph kernel
+  // it replaces at magnitudes where squaring b would overflow or underflow
+  // and the quotient itself would not.
+  kDivSafeGrouping = 1,
+};
+
+inline void div_partials_replay(double u, double a, double b, double* da,
+                                double* db) {
+  *da = u / b;
+  *db = -(u * a) / (b * b);
+}
+
+inline void div_partials(double u, double b, double out, double* da,
+                         double* db) {
+  const double ret = u / b;
+  *da = ret;
+  *db = -out * ret;
 }
 
 // Scalar unary math, one line each: opcode, kernel, registration, lowering
@@ -635,6 +689,7 @@ inline double pow_zero_base_partial(uint8_t law, double seed, double base,
   X(OP_GAMMA_P, gamma_p, gamma_p)                                           \
   X(OP_GAMMA_Q, gamma_q, gamma_q)                                           \
   X(OP_HYPOT, hypot, hypot)                                                 \
+  X(OP_HYPERGEOMETRIC_1F0, hypergeometric_1F0, hypergeometric_1F0)          \
   X(OP_LBETA, lbeta, lbeta)                                                 \
   X(OP_LCHOOSE, lchoose, binomial_coefficient_log)                          \
   X(OP_LMULTIPLY, lmultiply, lmultiply)                                     \
@@ -724,6 +779,41 @@ enum Opcode : uint16_t {
 #undef STANLI_UNARY_ENUM
       OP_COUNT_
 };
+
+// Value buffers a registered kernel's backward may read.  This is separate
+// from adjoint activity: a backward can route an adjoint through an input
+// without reading that input's primal value.  Unknown opcodes deliberately
+// claim every input and both outputs, so consumers may only discard a value
+// after recognizing the exact registered backward function as well.
+struct BackwardPrimalReads {
+  static constexpr uint8_t kAllInputs = 0x3fu;
+  static constexpr uint8_t kAllOutputs = 0x03u;
+  uint8_t input_mask = kAllInputs;
+  uint8_t output_mask = kAllOutputs;
+
+  constexpr bool input(int i) const {
+    return i < 0 || i >= 6 || (input_mask & (uint8_t)(1u << i)) != 0;
+  }
+  constexpr bool output(int i = 0) const {
+    return i < 0 || i >= 2 || (output_mask & (uint8_t)(1u << i)) != 0;
+  }
+  constexpr bool none() const { return input_mask == 0 && output_mask == 0; }
+};
+
+using BackwardPrimalReadFn = BackwardPrimalReads (*)(uint8_t variant);
+
+// Contracts are registered beside the implementation they describe. These
+// callbacks accept the variant even where today's implementation has one
+// rule for every variant.
+constexpr BackwardPrimalReads backward_reads_none(uint8_t variant) {
+  (void)variant;
+  return BackwardPrimalReads{0, 0};
+}
+
+constexpr BackwardPrimalReads backward_reads_inputs_only(uint8_t variant) {
+  (void)variant;
+  return BackwardPrimalReads{BackwardPrimalReads::kAllInputs, 0};
+}
 
 // OP_NONE_ is the graph's unregistered sentinel. A specialized Program::CALL
 // temporarily claims that otherwise-unused table slot for its fixed-size,
@@ -852,6 +942,7 @@ constexpr bool is_effectful_op(uint16_t opcode) {
     case OP_PRINT:
     case OP_REJECT:
     case OP_LOOP:
+    case OP_REDUCE_SUM:
       return true;
     default:
       return false;
@@ -889,7 +980,20 @@ struct Kernel {
   // Optional mutable state, created once per bound Executor/op. Graph udata
   // remains immutable and safely shared by executor copies.
   KernelState* (*make_state)(const Op&, const Slot* slots) = nullptr;
+  // Null is the conservative default: backward may read every primal. The
+  // callback lives on the registered implementation so replacing a kernel
+  // cannot accidentally inherit an opcode-only promise.
+  BackwardPrimalReadFn primal_reads = nullptr;
+  // Diagnostic description owned by this implementation, not the opcode.
+  // Unclassified is intentional: missing metadata never proves tape freedom.
+  const char* derivative_mechanism = "unclassified";
 };
+
+inline BackwardPrimalReads backward_primal_reads(const Kernel* kernel,
+                                                 uint8_t variant) {
+  return kernel && kernel->primal_reads ? kernel->primal_reads(variant)
+                                        : BackwardPrimalReads{};
+}
 
 // The most common Kernel::scratch_size shape: one scratch double per
 // element of every input.
