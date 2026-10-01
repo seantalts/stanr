@@ -9,8 +9,8 @@
 # Makevars and the headers are vendored into the package instead.
 set -e
 
-MATH_REF="8f326d14599d3030c626c46532d8e8534c1cdbec"
-STAN_REF="c96d04115d35cb04f42e45c5a69a82f9704798f1"
+MATH_REF="5252d51d47c1d5e78005fc043ad996fad6dd8da8"
+STAN_REF="a6806ef8477a7b5f65b27449ec33528c162bc024"
 MATH_SRC="math-$MATH_REF"
 STAN_SRC="stan-$STAN_REF"
 INC=../inst/include
@@ -298,7 +298,7 @@ text = text.replace(old, new, 1)
 open(path, "w").write(text)
 EOF
 }
-patch_size_t_overload "$INC/stan/callbacks/structured_writer.hpp" 0
+# structured_writer now uses uint32_t/uint64_t overloads and needs no shim.
 patch_size_t_overload "$INC/stan/callbacks/json_writer.hpp" 1
 
 # --- 7. TBB ------------------------------------------------------------
@@ -311,6 +311,7 @@ mkdir -p "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/math "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/numeric "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/serialization "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/unordered "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/preprocessor "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/mpl "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/utility "$INC/boost"
