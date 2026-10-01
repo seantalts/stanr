@@ -36,12 +36,17 @@ fetch() { # destination repository-url ref sparse-paths...
 }
 
 fetch "$MATH_SRC" https://github.com/stan-dev/math.git "$MATH_REF" stan lib
-fetch "$STAN_SRC" https://github.com/stan-dev/stan.git "$STAN_REF" src/stan
+fetch "$STAN_SRC" https://github.com/stan-dev/stan.git "$STAN_REF" src/stan lib/rapidjson_1.1.0
 
 # --- 2. Vendor the `stan` headers ------------------------------------------
 # Makevars: cp -Rf stan/src/stan ../inst/include/stan
 rm -rf "$INC/stan"
 cp -Rf "$STAN_SRC/src/stan" "$INC/stan"
+
+# Stanli's execution report uses RapidJSON; retain the headers from the same
+# Stan revision rather than relying on a system installation.
+rm -rf "$INC/rapidjson"
+cp -Rf "$STAN_SRC/lib/rapidjson_1.1.0/rapidjson" "$INC/rapidjson"
 
 # --- 3. Vendor the `math` headers (merged into inst/include/stan) ----------
 # Makevars: cp -Rf math/stan/. ../inst/include/stan
