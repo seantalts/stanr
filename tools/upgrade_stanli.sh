@@ -41,6 +41,9 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/diagnose.cpp" \
       "$SRC/runtime/src/walnuts.cpp" \
       "$SRC/runtime/src/pathfinder.cpp" \
+      "$SRC/runtime/src/pathfinder_service.cpp" \
+      "$SRC/runtime/src/algorithms.cpp" \
+      "$SRC/runtime/src/service_model.hpp" \
       "$SRC/runtime/src/data.cpp" \
       "$SRC/runtime/src/README.md" \
       "$SRC/runtime/src/OPTIMIZATIONS.md"
@@ -53,7 +56,8 @@ rm -f "$SRC/runtime/include/stanli/capi.h" \
       "$SRC/runtime/include/stanli/estimate.hpp" \
       "$SRC/runtime/include/stanli/diagnose.hpp" \
       "$SRC/runtime/include/stanli/walnuts.hpp" \
-      "$SRC/runtime/include/stanli/model_adapter.hpp"
+      "$SRC/runtime/include/stanli/model_adapter.hpp" \
+      "$SRC/runtime/include/stanli/algorithms.hpp"
 
 python3 - "$SRC/runtime/include/stanli/optable.hpp" "$SRC/runtime/kernels" << 'EOF'
 import glob
