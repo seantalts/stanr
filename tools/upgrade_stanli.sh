@@ -44,9 +44,10 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/pathfinder_service.cpp" \
       "$SRC/runtime/src/algorithms.cpp" \
       "$SRC/runtime/src/service_model.hpp" \
-      "$SRC/runtime/src/data.cpp" \
       "$SRC/runtime/src/README.md" \
       "$SRC/runtime/src/OPTIMIZATIONS.md"
+# Keep data.cpp: the initializer interpreter now calls DataMap::from_json,
+# even though stanr supplies model data directly from R values.
 # This optional dispatcher requires separately compiled AVX2 kernel variants
 # and ELF initializer sections. stanr builds the ordinary portable kernels.
 rm -f "$SRC/runtime/src/isa_dispatch.cpp"
