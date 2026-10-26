@@ -415,6 +415,7 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/assert "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/detail "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/core "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/container "$INC/boost"
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/intrusive "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/move "$INC/boost"
 
 # Trim filename for CRAN 100-character limit
@@ -470,6 +471,7 @@ for file in \
   "$INC/boost/container/stable_vector.hpp" \
   "$INC/boost/get_pointer.hpp" \
   "$INC/boost/iterator/advance.hpp" \
+  "$INC/boost/intrusive/pointer_plus_bits.hpp" \
   "$INC/boost/move/algo/adaptive_merge.hpp" \
   "$INC/boost/move/algo/adaptive_sort.hpp" \
   "$INC/boost/move/algo/detail/adaptive_sort_merge.hpp" \
@@ -481,6 +483,7 @@ for file in \
   "$INC/boost/move/algo/detail/search.hpp" \
   "$INC/boost/move/algo/detail/set_difference.hpp" \
   "$INC/boost/move/detail/std_ns_begin.hpp" \
+  "$INC/boost/move/detail/std_ns_end.hpp" \
   "$INC/boost/mpl/assert.hpp" \
   "$INC/boost/random/detail/disable_warnings.hpp" \
   "$INC/boost/range/adaptor/indexed.hpp" \
@@ -489,11 +492,11 @@ for file in \
 do
   if [ -f "$file" ]; then
     sed -i.bak \
-      -e '/#pragma clang diagnostic/d' \
-      -e '/#pragma GCC diagnostic/d' \
+      -e '/#[[:blank:]]*pragma[[:blank:]]*clang[[:blank:]]*diagnostic/d' \
+      -e '/#[[:blank:]]*pragma[[:blank:]]*GCC[[:blank:]]*diagnostic/d' \
       -e '/#pragma warning( *push *)/d' \
       -e '/#pragma warning( *disable *:/d' \
-      -e '/#pragma warning( *pop *)/d' \
+      -e '/#pragma warning *( *pop *)/d' \
       -e '/#pragma warning push/d' \
       -e '/#pragma warning disable/d' \
       "$file"

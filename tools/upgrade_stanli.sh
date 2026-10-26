@@ -41,17 +41,25 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/diagnose.cpp" \
       "$SRC/runtime/src/walnuts.cpp" \
       "$SRC/runtime/src/pathfinder.cpp" \
-      "$SRC/runtime/src/data.cpp" \
+      "$SRC/runtime/src/pathfinder_service.cpp" \
+      "$SRC/runtime/src/algorithms.cpp" \
+      "$SRC/runtime/src/service_model.hpp" \
       "$SRC/runtime/src/README.md" \
       "$SRC/runtime/src/OPTIMIZATIONS.md"
-# Private helper for nuts.cpp/estimate.cpp/pathfinder.cpp only -- dead once
-# all three algorithm frontends above are stripped.
+# Keep data.cpp: the initializer interpreter now calls DataMap::from_json,
+# even though stanr supplies model data directly from R values.
+# This optional dispatcher requires separately compiled AVX2 kernel variants
+# and ELF initializer sections. stanr builds the ordinary portable kernels.
+rm -f "$SRC/runtime/src/isa_dispatch.cpp"
+# Private helpers for Stanli's inference frontends. stanr provides its own
+# model adapter and calls Stan's services directly.
 rm -f "$SRC/runtime/src/initialize.hpp"
 rm -f "$SRC/runtime/include/stanli/capi.h" \
       "$SRC/runtime/include/stanli/bridgestan_internal.hpp" \
       "$SRC/runtime/include/stanli/nuts.hpp" \
       "$SRC/runtime/include/stanli/estimate.hpp" \
       "$SRC/runtime/include/stanli/diagnose.hpp" \
+      "$SRC/runtime/include/stanli/algorithms.hpp" \
       "$SRC/runtime/include/stanli/walnuts.hpp" \
       "$SRC/runtime/include/stanli/model_adapter.hpp"
 
