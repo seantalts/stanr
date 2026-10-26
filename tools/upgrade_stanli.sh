@@ -41,6 +41,7 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/diagnose.cpp" \
       "$SRC/runtime/src/walnuts.cpp" \
       "$SRC/runtime/src/pathfinder.cpp" \
+      "$SRC/runtime/src/pathfinder_service.cpp" \
       "$SRC/runtime/src/algorithms.cpp" \
       "$SRC/runtime/src/service_model.hpp" \
       "$SRC/runtime/src/data.cpp" \
