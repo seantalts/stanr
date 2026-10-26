@@ -496,7 +496,7 @@ do
       -e '/#[[:blank:]]*pragma[[:blank:]]*GCC[[:blank:]]*diagnostic/d' \
       -e '/#pragma warning( *push *)/d' \
       -e '/#pragma warning( *disable *:/d' \
-      -e '/#pragma warning( *pop *)/d' \
+      -e '/#pragma warning *( *pop *)/d' \
       -e '/#pragma warning push/d' \
       -e '/#pragma warning disable/d' \
       "$file"
