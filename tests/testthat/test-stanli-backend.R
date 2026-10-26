@@ -471,7 +471,7 @@ test_that("stanli inverse transforms handle constrained containers", {
     data = list(),
     chains = 1,
     iter_warmup = 5,
-    iter_sampling = 2,
+    iter_sampling = 5,
     seed = 2,
     show_messages = FALSE,
     init = list(sigma = 2, p = c(0.2, 0.3, 0.5))
