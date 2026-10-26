@@ -47,6 +47,9 @@ rm -f "$SRC/runtime/src/capi.cpp" \
       "$SRC/runtime/src/data.cpp" \
       "$SRC/runtime/src/README.md" \
       "$SRC/runtime/src/OPTIMIZATIONS.md"
+# This optional dispatcher requires separately compiled AVX2 kernel variants
+# and ELF initializer sections. stanr builds the ordinary portable kernels.
+rm -f "$SRC/runtime/src/isa_dispatch.cpp"
 # Private helpers for Stanli's inference frontends. stanr provides its own
 # model adapter and calls Stan's services directly.
 rm -f "$SRC/runtime/src/initialize.hpp"
