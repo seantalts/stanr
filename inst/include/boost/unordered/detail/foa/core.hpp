@@ -1222,8 +1222,6 @@ _LIBCPP_SUPPRESS_DEPRECATED_PUSH
 #elif defined(_STL_DISABLE_DEPRECATED_WARNING)
 _STL_DISABLE_DEPRECATED_WARNING
 #elif defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable:4996)
 #endif
 
 template<typename Allocator,typename Ptr,typename... Args>
@@ -1248,7 +1246,6 @@ _LIBCPP_SUPPRESS_DEPRECATED_POP
 #elif defined(_STL_RESTORE_DEPRECATED_WARNING)
 _STL_RESTORE_DEPRECATED_WARNING
 #elif defined(_MSC_VER)
-#pragma warning(pop)
 #endif
 
 /* We expose the hard-coded max load factor so that tests can use it without
@@ -1395,16 +1392,12 @@ using is_emplace_kv_able = std::integral_constant<bool,
 #include <boost/unordered/detail/foa/ignore_wshadow.hpp>
 
 #if defined(BOOST_MSVC)
-#pragma warning(push)
-#pragma warning(disable:4714) /* marked as __forceinline not inlined */
 #endif
 
 #if BOOST_WORKAROUND(BOOST_MSVC,<=1900)
 /* VS2015 marks as unreachable generic catch clauses around non-throwing
  * code.
  */
-#pragma warning(push)
-#pragma warning(disable:4702)
 #endif
 
 template<
@@ -1460,8 +1453,6 @@ public:
 #endif
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
   table_core(
@@ -1473,7 +1464,6 @@ public:
     {}
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic pop
 #endif
 
   /* genericize on an ArraysFn so that we can do things like delay an
@@ -1612,8 +1602,6 @@ public:
   }
 
 #if defined(BOOST_MSVC)
-#pragma warning(push)
-#pragma warning(disable:4127) /* conditional expression is constant */
 #endif
 
   table_core& operator=(table_core&& x)
@@ -1678,7 +1666,6 @@ public:
   }
 
 #if defined(BOOST_MSVC)
-#pragma warning(pop) /* C4127 */
 #endif
 
   allocator_type get_allocator()const noexcept{return al();}
@@ -1710,8 +1697,6 @@ public:
 
 #if defined(BOOST_MSVC)
 /* warning: forcing value to bool 'true' or 'false' in bool(pred()...) */
-#pragma warning(push)
-#pragma warning(disable:4800)
 #endif
 
   template<typename Key>
@@ -1753,7 +1738,6 @@ public:
   }
 
 #if defined(BOOST_MSVC)
-#pragma warning(pop) /* C4800 */
 #endif
 
   void swap(table_core& x)
@@ -2091,8 +2075,6 @@ private:
   using allocator_base=empty_value<Allocator,2>;
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
   /* used by allocator-extended move ctor */
@@ -2106,7 +2088,6 @@ private:
   }
 
 #if defined(BOOST_GCC)
-#pragma GCC diagnostic pop
 #endif
 
   arrays_type new_arrays(std::size_t n)const
@@ -2384,11 +2365,9 @@ private:
 };
 
 #if BOOST_WORKAROUND(BOOST_MSVC,<=1900)
-#pragma warning(pop) /* C4702 */
 #endif
 
 #if defined(BOOST_MSVC)
-#pragma warning(pop) /* C4714 */
 #endif
 
 #include <boost/unordered/detail/foa/restore_wshadow.hpp>

@@ -419,7 +419,11 @@ for file in \
   "$INC/boost/random/detail/disable_warnings.hpp" \
   "$INC/boost/range/adaptor/indexed.hpp" \
   "$INC/boost/type_traits/detail/has_prefix_operator.hpp" \
-  "$INC/boost/type_traits/has_logical_not.hpp"
+  "$INC/boost/type_traits/has_logical_not.hpp" \
+  "$INC/boost/unordered/detail/archive_constructed.hpp" \
+  "$INC/boost/unordered/detail/foa/core.hpp" \
+  "$INC/boost/unordered/detail/foa/ignore_wshadow.hpp" \
+  "$INC/boost/unordered/unordered_printers.hpp"
 do
   if [ -f "$file" ]; then
     sed -i.bak \
@@ -434,5 +438,19 @@ do
     rm -f "$file.bak"
   fi
 done
+
+# Math 5.4 passes string_view iterators to std::from_chars, which only takes
+# pointers; emscripten's libc++ iterators are not pointers.
+python3 - "$INC/stan/math/prim/core/init_threadpool_tbb.hpp" << 'EOF'
+import sys
+
+path = sys.argv[1]
+text = open(path).read()
+old = "std::from_chars(value.begin(), value.end(), num_threads);"
+new = "std::from_chars(value.data(), value.data() + value.size(), num_threads);"
+assert old in text, "from_chars call not found -- init_threadpool_tbb.hpp changed upstream"
+text = text.replace(old, new, 1)
+open(path, "w").write(text)
+EOF
 
 echo "Done. Vendored math@$MATH_REF and stan@$STAN_REF into inst/include."
