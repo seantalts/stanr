@@ -450,6 +450,10 @@ old = "std::from_chars(value.begin(), value.end(), num_threads);"
 new = "std::from_chars(value.data(), value.data() + value.size(), num_threads);"
 assert old in text, "from_chars call not found -- init_threadpool_tbb.hpp changed upstream"
 text = text.replace(old, new, 1)
+old = "end != value.end()"
+new = "end != value.data() + value.size()"
+assert old in text, "from_chars end check not found -- init_threadpool_tbb.hpp changed upstream"
+text = text.replace(old, new, 1)
 open(path, "w").write(text)
 EOF
 

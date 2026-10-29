@@ -54,7 +54,7 @@ inline int get_num_threads() {
   int num_threads;
   const auto [end, error]
       = std::from_chars(value.data(), value.data() + value.size(), num_threads);
-  if (error != std::errc() || end != value.end()
+  if (error != std::errc() || end != value.data() + value.size()
       || (num_threads < 1 && num_threads != -1)) {
     invalid_argument("get_num_threads(int)", "STAN_NUM_THREADS",
                      env_stan_num_threads,
