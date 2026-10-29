@@ -6,6 +6,7 @@
 #include <stan/services/pathfinder/single.hpp>
 #include <stan/services/pathfinder/multi.hpp>
 #include <stan/callbacks/structured_writer.hpp>
+#include <type_traits>
 #include <vector>
 #include "r_output.hpp"
 #include "r_interrupt.hpp"
@@ -14,6 +15,17 @@
 #include <stanr/r_data_context.hpp>
 
 namespace stanr {
+  // A structured_writer that discards everything, including the std::size_t
+  // values Pathfinder writes. Stan 2.40's integer overloads are fixed-width,
+  // so where std::size_t is neither uint32_t nor uint64_t (macOS, wasm) the
+  // base-class call is ambiguous.
+  class quiet_structured_writer : public stan::callbacks::structured_writer {
+   public:
+    using stan::callbacks::structured_writer::write;
+    template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+    void write(const std::string&, T) {}
+  };
+
   template <class Model>
   cpp11::writable::list run_pathfinder(Model& model, cpp11::list args) {
     const unsigned int seed = stanr::as_cpp<unsigned int>(args["seed"]);
@@ -53,7 +65,7 @@ namespace stanr {
       stan::callbacks::writer init_writer;
       stanr::r_sample_writer sample_writer(num_draws);
       // No-op: the LBFGS inverse-metric estimate is not exposed to R.
-      stan::callbacks::structured_writer metric_writer;
+      stanr::quiet_structured_writer metric_writer;
 
       return_code = stan::services::pathfinder::pathfinder_lbfgs_single<false, false>(
           model, init_ctx, seed, chain_id, init_radius,
@@ -83,12 +95,12 @@ namespace stanr {
       // Only the PSIS-resampled draws are returned; base writers are no-ops
       // so Stan doesn't retain every per-path candidate draw.
       std::vector<stan::callbacks::writer> single_param_writers(num_paths);
-      std::vector<stan::callbacks::structured_writer> single_diag_writers(
+      std::vector<stanr::quiet_structured_writer> single_diag_writers(
           num_paths);
 
       // Final combined parameter writer
       stanr::r_sample_writer param_writer(num_psis_draws);
-      stan::callbacks::structured_writer diag_writer;
+      stanr::quiet_structured_writer diag_writer;
 
       // Init writers (one per path, for writing initial values)
       std::vector<stan::callbacks::writer> init_writers(num_paths);
