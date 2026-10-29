@@ -17,6 +17,10 @@
 
 namespace stanli {
 
+namespace {
+constexpr size_t kMinMicroRun = 2;
+}  // namespace
+
 using ForwardFn = void (*)(KernelCtx&);
 ForwardFn resolve_forward_fn(const Op& op);
 
@@ -36,6 +40,10 @@ static bool g_packet_math = [] {
 
 bool packet_math() { return g_packet_math; }
 void set_packet_math(bool on) { g_packet_math = on; }
+
+static bool g_fixed_small_matrices = true;
+bool fixed_small_matrices() { return g_fixed_small_matrices; }
+void set_fixed_small_matrices(bool on) { g_fixed_small_matrices = on; }
 
 // Set only for the duration of Executor::forward_value_only(). Kernels
 // that read it must still write ctx.out; all they may skip is work whose
@@ -77,8 +85,8 @@ const Kernel* find_kernel(uint16_t opcode) {
 // integer/shape metadata are immutable call-site facts, so builders resolve
 // the former once and a program invocation reuses one context packet across
 // all of its CALL instructions.
-static void bind_call_fwd_ctx(const Program::Call& call, double* reg,
-                              KernelCtx& ctx, EvalState* state) {
+void bind_call_fwd_ctx(const Program::Call& call, double* reg, KernelCtx& ctx,
+                       EvalState* state) {
   ctx.n_in = call.n_in;
   for (int k = 0; k < call.n_in; ++k)
     ctx.in[k] = Desc{reg + call.in[k], call.in_len[k]};
@@ -272,6 +280,7 @@ void register_mixture_kernels();
 void register_message_kernels();
 void register_rng_kernel();
 void register_island_kernel();
+void register_region_map_kernel();
 void register_structured_loop_kernel();
 void register_reduce_sum_kernel();
 
@@ -295,6 +304,7 @@ static void ensure_registered() {
     register_scalar_unary_ad_kernels();
     register_mixture_kernels();
     register_island_kernel();
+    register_region_map_kernel();
     register_structured_loop_kernel();
     register_reduce_sum_kernel();
     return true;
@@ -385,11 +395,26 @@ Executor::Executor(Graph g) : graph_(std::move(g)) {
   bind_();
 }
 
+Executor::Executor(Graph g, std::vector<Borrow> borrows)
+    : graph_(std::move(g)) {
+  ensure_registered();
+  graph_.compact_idata();
+  borrowed_.assign(graph_.slots.size(), nullptr);
+  for (const auto& borrow : borrows) {
+    if (borrow.slot < 0 || size_t(borrow.slot) >= graph_.slots.size() ||
+        !borrow.data)
+      throw std::invalid_argument("borrowed slot is not in the graph");
+    borrowed_[size_t(borrow.slot)] = borrow.data;
+  }
+  bind_();
+}
+
 Executor::Executor(const Executor& src)
     : graph_(src.graph_),
       data_(src.data_pointer_exposed_
                 ? std::make_shared<std::vector<double>>(*src.data_)
-                : src.data_) {
+                : src.data_),
+      borrowed_(src.borrowed_) {
   ensure_registered();
   bind_();
   std::copy(src.values_.begin(), src.values_.end(), values_.begin());
@@ -435,8 +460,13 @@ void Executor::bind_() {
   n_params_ = off;
   for (size_t i = 0; i < graph_.slots.size(); ++i) {
     auto& s = graph_.slots[i];
+    const bool borrowed = !borrowed_.empty() && borrowed_[i];
+    if (borrowed && (s.is_param || written[i]))
+      throw std::invalid_argument("only unwritten data can be borrowed");
     if (s.is_param) continue;
-    if (written[i]) {
+    if (borrowed) {
+      s.offset = 0;
+    } else if (written[i]) {
       if (has_shared_primals && primal_sources[i] >= 0) continue;
       s.offset = off;
       off = checked_size(off, s.len);
@@ -555,15 +585,66 @@ void Executor::bind_() {
     if (op.primal_source < 0 || op.primal_source == op.out)
       fwd_fn_.push_back(resolve_forward_fn(op));
   }
-  for (size_t i = graph_.ops.size(); i-- > 0;) {
-    void (*b)(KernelCtx&) = kernel(graph_.ops[i].opcode).backward;
-    if (b) {
-      const int o2 = graph_.ops[i].out2;
-      const double* out2 =
-          o2 >= 0 ? adjoints_.data() + adjoint_offsets[o2] : nullptr;
-      const size_t ci = has_shared_primals ? (size_t)primal_sources[i] : i;
-      bwd_.push_back(BwdStep{b, &ctx_[ci], out2});
+  micro_.clear();
+  micro_runs_.clear();
+  fused_.clear();
+  struct Pending {
+    size_t ci;
+    const Kernel* k;
+    uint16_t opcode;
+  };
+  std::vector<Pending> pending;
+  size_t run_start = 0;
+  const auto close_run = [&] {
+    if (pending.empty()) return;
+    if (micro_.size() - run_start >= kMinMicroRun) {
+      micro_runs_.push_back(MicroRun{static_cast<uint32_t>(run_start),
+                                     static_cast<uint32_t>(micro_.size()),
+                                     static_cast<uint32_t>(bwd_.size())});
+      bwd_.push_back(BwdStep{nullptr, nullptr, nullptr});
+      for (const Pending& p : pending)
+        fused_.push_back(FusedOp{&ctx_[p.ci], p.k->cached_micro, p.opcode});
+    } else {
+      micro_.resize(run_start);
+      for (const Pending& p : pending)
+        bwd_.push_back(BwdStep{p.k->backward, &ctx_[p.ci], nullptr});
     }
+    pending.clear();
+  };
+  for (size_t i = graph_.ops.size(); i-- > 0;) {
+    const Op& op = graph_.ops[i];
+    const Kernel& k = kernel(op.opcode);
+    void (*b)(KernelCtx&) = k.backward;
+    if (!b) continue;
+    const size_t ci = has_shared_primals ? (size_t)primal_sources[i] : i;
+    if (has_shared_primals && op.primal_source >= 0 &&
+        op.primal_source != op.out && op.out2 < 0 && k.cached_micro) {
+      const size_t before = micro_.size();
+      if (pending.empty()) run_start = before;
+      if (k.cached_micro(ctx_[ci], micro_)) {
+        for (size_t m = before; m < micro_.size(); ++m)
+          micro_[m].opcode = op.opcode;
+        if (micro_.size() != before)
+          pending.push_back(Pending{ci, &k, op.opcode});
+        continue;
+      }
+      micro_.resize(before);
+    }
+    close_run();
+    const int o2 = op.out2;
+    const double* out2 =
+        o2 >= 0 ? adjoints_.data() + adjoint_offsets[o2] : nullptr;
+    bwd_.push_back(BwdStep{b, &ctx_[ci], out2});
+  }
+  close_run();
+}
+
+void Executor::refresh_micros_() {
+  micro_.clear();
+  for (const FusedOp& f : fused_) {
+    const size_t before = micro_.size();
+    f.fn(*f.ctx, micro_);
+    for (size_t m = before; m < micro_.size(); ++m) micro_[m].opcode = f.opcode;
   }
 }
 
@@ -622,9 +703,12 @@ void Executor::detach_data_() {
       if (data_offsets_[slot] >= 0) ctx_[ci].in[i].data = slot_data_(slot);
     }
   }
+  refresh_micros_();
 }
 
 double* Executor::value_ptr(int slot) {
+  if (!borrowed_.empty() && borrowed_[slot])
+    throw std::logic_error("borrowed slot is read-only");
   if (data_offsets_[slot] >= 0) {
     detach_data_();
     data_pointer_exposed_ = true;
@@ -636,6 +720,8 @@ void Executor::set_values(int slot, const double* data, size_t size) {
   if (slot < 0 || static_cast<size_t>(slot) >= graph_.slots.size() ||
       size > static_cast<uint64_t>(graph_.slots[slot].len))
     throw std::out_of_range("executor fill exceeds slot");
+  if (!borrowed_.empty() && borrowed_[slot])
+    throw std::logic_error("borrowed slot is read-only");
   if (data_offsets_[slot] >= 0) detach_data_();
   if (size) std::copy_n(data, size, slot_data_(slot));
 }
@@ -765,6 +851,57 @@ double Executor::gradient(double* grad_out) {
   return v;
 }
 
+namespace {
+
+template <class Step>
+inline void run_bwd_step(const Step& s) {
+  KernelCtx& ctx = *s.ctx;
+  if (ctx.out_adj_vec.len == 1) ctx.out_adj = ctx.out_adj_vec.data[0];
+  if (s.out2_adj) ctx.out2_adj = *s.out2_adj;
+  s.fn(ctx);
+}
+
+inline void run_micro_range(const BwdMicro* m, const BwdMicro* end) {
+  for (; m != end; ++m) run_bwd_micro(*m);
+}
+
+template <class Steps, class Runs>
+[[gnu::noinline]] void reverse_dense_micro(const Steps& bwd, const Runs& runs,
+                                           const std::vector<BwdMicro>& micro) {
+  size_t run = 0;
+  for (const auto& s : bwd) {
+    if (s.fn) {
+      run_bwd_step(s);
+      continue;
+    }
+    const auto r = runs[run++];
+    run_micro_range(micro.data() + r.begin, micro.data() + r.end);
+  }
+}
+
+template <class Steps, class Runs>
+[[gnu::noinline]] void reverse_sparse_micro(
+    const Steps& bwd, const Runs& runs, const std::vector<BwdMicro>& micro) {
+  const auto plain = [&](size_t i, const size_t end) {
+    for (; i + 4 <= end; i += 4) {
+      run_bwd_step(bwd[i]);
+      run_bwd_step(bwd[i + 1]);
+      run_bwd_step(bwd[i + 2]);
+      run_bwd_step(bwd[i + 3]);
+    }
+    for (; i < end; ++i) run_bwd_step(bwd[i]);
+  };
+  size_t pos = 0;
+  for (const auto& r : runs) {
+    plain(pos, r.at);
+    run_micro_range(micro.data() + r.begin, micro.data() + r.end);
+    pos = r.at + 1;
+  }
+  plain(pos, bwd.size());
+}
+
+}  // namespace
+
 void Executor::reverse(double* grad_out, double seed) {
   if (!reverse_ready_)
     throw std::logic_error("reverse requires a fresh forward");
@@ -782,7 +919,20 @@ void Executor::reverse(double* grad_out, double seed) {
     // Profile the exact bound backward plan. Each context belongs to ctx_,
     // so its index supplies opcode attribution without a second graph walk
     // or extra fields in the fast-path BwdStep layout.
+    size_t run = 0;
     for (const BwdStep& step : bwd_) {
+      if (!step.fn) {
+        const MicroRun r = micro_runs_[run++];
+        for (uint32_t m = r.begin; m < r.end; ++m) {
+          const auto t0 = std::chrono::steady_clock::now();
+          run_bwd_micro(micro_[m]);
+          prof_[micro_[m].opcode].bwd_ns +=
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+        }
+        continue;
+      }
       KernelCtx& ctx = *step.ctx;
       const size_t pi = static_cast<size_t>(step.ctx - ctx_.data());
       assert(pi < graph_.ops.size());
@@ -809,6 +959,15 @@ void Executor::reverse(double* grad_out, double seed) {
     s.fn(ctx);
   };
   const size_t nb = bwd_.size();
+  if (!micro_runs_.empty()) {
+    if (micro_.size() * 2 < nb)
+      reverse_sparse_micro(bwd_, micro_runs_, micro_);
+    else
+      reverse_dense_micro(bwd_, micro_runs_, micro_);
+    if (n_params_)
+      std::memcpy(grad_out, adjoints_.data(), sizeof(double) * n_params_);
+    return;
+  }
   size_t i = 0;
   for (; i + 4 <= nb; i += 4) {
     step(bwd_[i]);

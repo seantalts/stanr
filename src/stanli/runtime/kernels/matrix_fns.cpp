@@ -7,6 +7,8 @@
 //
 // Matrices live in slots column-major, matching Eigen and the rest of the
 // pipeline, so a flat slot maps straight onto Map<MatrixXd>.
+#include "density_fused.hpp"
+
 #include <stanli/graph.hpp>
 #include <stanli/density_registry.hpp>
 #include <stanli/recorder.hpp>
@@ -17,6 +19,7 @@
 #include <stan/math.hpp>
 
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -29,6 +32,23 @@ using MatD = Eigen::MatrixXd;
 using VecD = Eigen::VectorXd;
 using MapM = Eigen::Map<MatD>;
 using CMapM = Eigen::Map<const MatD>;
+template <int R, int C>
+using FixM = Eigen::Matrix<double, R, C>;
+template <int R, int C>
+using FixMap = Eigen::Map<FixM<R, C>>;
+template <int R, int C>
+using FixCMap = Eigen::Map<const FixM<R, C>>;
+template <int V>
+using IntC = std::integral_constant<int, V>;
+
+template <typename F>
+void with_small_nm(int64_t n, int64_t m, F&& f) {
+  if (fixed_small_matrices()) {
+    if (n == 2 && m == 1) return f(IntC<2>{}, IntC<1>{});
+    if (n == 2 && m == 2) return f(IntC<2>{}, IntC<2>{});
+  }
+  f(IntC<-1>{}, IntC<-1>{});
+}
 using CMapV = Eigen::Map<const VecD>;
 using VarV = Eigen::Matrix<stan::math::var, -1, 1>;
 using VarM = Eigen::Matrix<stan::math::var, -1, -1>;
@@ -215,10 +235,16 @@ void diag_bwd(KernelCtx& ctx) {
 }
 
 // ---- cholesky_decompose(A) ------------------------------------------------
+template <int N>
+void chol_fwd_t(KernelCtx& ctx) {
+  const int64_t n = ctx.idata[0];
+  FixM<N, N> a = FixCMap<N, N>(ctx.in[0].data, n, n);
+  FixMap<N, N>(ctx.out.data, n, n) = stan::math::cholesky_decompose(a);
+}
 void chol_fwd(KernelCtx& ctx) {
   const int64_t n = ctx.idata[0];
-  MatD a = CMapM(ctx.in[0].data, n, n);
-  MapM(ctx.out.data, n, n) = stan::math::cholesky_decompose(a);
+  if (n == 2 && fixed_small_matrices()) return chol_fwd_t<2>(ctx);
+  chol_fwd_t<Eigen::Dynamic>(ctx);
 }
 // Minimal adjoint views let the pinned Stan Math pullbacks operate directly
 // on the saved factor and executor adjoints, with no vari or nested tape.
@@ -228,9 +254,33 @@ struct MatrixAdjointView {
   Eigen::Index cols() const { return storage.cols(); }
   MapM& adj() { return storage; }
 };
+void chol_bwd_small(KernelCtx& ctx, int n) {
+  const double* L_A = ctx.out.data;
+  double adjL[4], adjA[4] = {};
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j <= i; ++j)
+      adjL[i * n + j] = ctx.out_adj_vec.data[j * n + i];
+  for (int i = n - 1; i >= 0; --i) {
+    for (int j = i; j >= 0; --j) {
+      if (i == j) {
+        adjA[j * n + i] = 0.5 * adjL[i * n + j] / L_A[j * n + i];
+      } else {
+        adjA[j * n + i] = adjL[i * n + j] / L_A[j * n + j];
+        adjL[j * n + j] -= adjL[i * n + j] * L_A[j * n + i] / L_A[j * n + j];
+      }
+      for (int k = j - 1; k >= 0; --k) {
+        adjL[i * n + k] -= adjA[j * n + i] * L_A[k * n + j];
+        adjL[j * n + k] -= adjA[j * n + i] * L_A[k * n + i];
+      }
+    }
+  }
+  for (int i = 0; i < n * n; ++i) ctx.in_adj[0].data[i] += adjA[i];
+}
 void chol_bwd(KernelCtx& ctx) {
   if (!ctx.in_adj[0].data) return;
   const int64_t n = ctx.idata[0];
+  if (n <= 2 && fixed_small_matrices())
+    return chol_bwd_small(ctx, static_cast<int>(n));
   CMapM factor(ctx.out.data, n, n);
   MatrixAdjointView out{MapM(ctx.out_adj_vec.data, n, n)};
   MatrixAdjointView in{MapM(ctx.in_adj[0].data, n, n)};
@@ -340,45 +390,89 @@ void log_det_bwd(KernelCtx& ctx) {
 // quad_form_sym convention: bit 0 marks vector B and bit 1 marks an active
 // expression. The active vector overload associates B' * A * B, whereas the
 // primitive overload uses B.dot(A * B).
-void qf_fwd(KernelCtx& ctx) {
-  const int64_t n = ctx.idata[0], m = ctx.idata[1];
-  const CMapM a(ctx.in[0].data, n, n);
-  if (!(ctx.variant & 1u)) {
-    MapM(ctx.out.data, m, m) =
-        stan::math::quad_form(a, CMapM(ctx.in[1].data, n, m));
-    return;
+template <int N, typename A, typename B>
+FixM<N == Eigen::Dynamic ? Eigen::Dynamic : 1,
+     N == Eigen::Dynamic ? Eigen::Dynamic : 1>
+quad_vec_chain(const A& a, const B& b) {
+  if constexpr (N == Eigen::Dynamic) {
+    return b.transpose() * a * b;
+  } else {
+    const FixM<1, N> t = b.transpose() * a + FixM<1, N>::Zero();
+    return t * b;
   }
-  const VecD b = CMapV(ctx.in[1].data, n);
-  if (!(ctx.variant & 2u)) {
-    ctx.out.data[0] = stan::math::quad_form(a, b);
-    return;
-  }
-  stan::math::check_square("quad_form", "A", a);
-  stan::math::check_multiplicable("quad_form", "A", a, "B", b);
-  const MatD c = b.transpose() * a * b;
-  ctx.out.data[0] = c(0, 0);
 }
-void qf_bwd_impl(KernelCtx& ctx, int64_t n, int64_t m, bool vec) {
+template <int N, int M, bool Vec>
+void qf_fwd_t(KernelCtx& ctx) {
+  constexpr int K = (N == Eigen::Dynamic) ? Eigen::Dynamic : (Vec ? 1 : M);
+  const int64_t n = ctx.idata[0], m = ctx.idata[1];
+  const FixCMap<N, N> a(ctx.in[0].data, n, n);
+  if constexpr (!Vec) {
+    const FixCMap<N, M> b(ctx.in[1].data, n, m);
+    if constexpr (N == 2) {
+      stan::math::check_square("quad_form", "A", a);
+      stan::math::check_multiplicable("quad_form", "A", a, "B", b);
+      FixMap<M, M>(ctx.out.data, m, m) =
+          b.transpose() * a * b + FixM<M, M>::Zero();
+    } else {
+      FixMap<M, M>(ctx.out.data, m, m) = stan::math::quad_form(a, b);
+    }
+  } else {
+    const FixM<N, 1> b = Eigen::Map<const FixM<N, 1>>(ctx.in[1].data, n);
+    if (!(ctx.variant & 2u)) {
+      if constexpr (N == Eigen::Dynamic) {
+        ctx.out.data[0] = stan::math::quad_form(a, b);
+      } else {
+        stan::math::check_square("quad_form", "A", a);
+        stan::math::check_multiplicable("quad_form", "A", a, "B", b);
+        const FixM<N, 1> y = a * b + FixM<N, 1>::Zero();
+        ctx.out.data[0] = b.dot(y);
+      }
+      return;
+    }
+    stan::math::check_square("quad_form", "A", a);
+    stan::math::check_multiplicable("quad_form", "A", a, "B", b);
+    const FixM<K, K> c = quad_vec_chain<N>(a, b);
+    ctx.out.data[0] = c(0, 0);
+  }
+}
+template <typename F>
+void qf_shape_dispatch(const KernelCtx& ctx, F&& f) {
+  const int64_t n = ctx.idata[0];
+  const bool vec = ctx.variant & 1u;
+  if (n == 2 && fixed_small_matrices()) {
+    if (vec) return f(IntC<2>{}, IntC<1>{}, std::true_type{});
+    if (ctx.idata[1] == 2) return f(IntC<2>{}, IntC<2>{}, std::false_type{});
+  }
+  if (vec) return f(IntC<-1>{}, IntC<-1>{}, std::true_type{});
+  f(IntC<-1>{}, IntC<-1>{}, std::false_type{});
+}
+void qf_fwd(KernelCtx& ctx) {
+  qf_shape_dispatch(
+      ctx, [&](auto N, auto M, auto Vec) { qf_fwd_t<N, M, Vec>(ctx); });
+}
+template <int N, int M>
+void qf_bwd_t(KernelCtx& ctx, bool vec) {
   if (!ctx.in_adj[0].data && !ctx.in_adj[1].data) return;
-  const CMapM a(ctx.in[0].data, n, n);
-  const CMapM b(ctx.in[1].data, n, m);
-  MatD g(m, m);
+  const int64_t n = ctx.idata[0], m = vec ? 1 : ctx.idata[1];
+  const FixCMap<N, N> a(ctx.in[0].data, n, n);
+  const FixCMap<N, M> b(ctx.in[1].data, n, m);
+  FixM<M, M> g(m, m);
   if (vec) {
     g(0, 0) = ctx.out_adj;
   } else {
-    g = CMapM(ctx.out_adj_vec.data, m, m);
+    g = FixCMap<M, M>(ctx.out_adj_vec.data, m, m);
   }
   if (ctx.in_adj[0].data)
-    MapM(ctx.in_adj[0].data, n, n) += b * g * b.transpose();
+    FixMap<N, N>(ctx.in_adj[0].data, n, n) += b * g * b.transpose();
   if (ctx.in_adj[1].data)
-    MapM(ctx.in_adj[1].data, n, m) +=
+    FixMap<N, M>(ctx.in_adj[1].data, n, m) +=
         a * b * g.transpose() + a.transpose() * b * g;
 }
-void qf_bwd(KernelCtx& ctx) {
-  const int64_t n = ctx.idata[0];
-  const bool vec = ctx.variant & 1u;
-  qf_bwd_impl(ctx, n, vec ? 1 : ctx.idata[1], vec);
+void qf_bwd_impl(KernelCtx& ctx, bool vec) {
+  with_small_nm(ctx.idata[0], vec ? 1 : ctx.idata[1],
+                [&](auto N, auto M) { qf_bwd_t<N, M>(ctx, vec); });
 }
+void qf_bwd(KernelCtx& ctx) { qf_bwd_impl(ctx, ctx.variant & 1u); }
 
 // ---- add_diag(A, d) -------------------------------------------------------
 // idata = {rows, cols}; variant 0 is a vector diagonal, 1 is a scalar.
@@ -423,31 +517,47 @@ void add_diag_bwd(KernelCtx& ctx) {
 // B.dot(A * B), a gemv and then a dot, while the rev path builds a
 // quad_form_vari over a column vector and evaluates B' * A * B, grouping
 // from the other end. The matrix overload has one association in both.
-void qfs_fwd(KernelCtx& ctx) {
+template <int N, int M, bool Vec>
+void qfs_fwd_t(KernelCtx& ctx) {
+  constexpr int K = (N == Eigen::Dynamic) ? Eigen::Dynamic : (Vec ? 1 : M);
   const int64_t n = ctx.idata[0], m = ctx.idata[1];
-  const CMapM a(ctx.in[0].data, n, n);
-  if (!(ctx.variant & 1u)) {
-    const CMapM b(ctx.in[1].data, n, m);
-    MapM(ctx.out.data, m, m) = stan::math::quad_form_sym(a, b);
-    return;
+  const FixCMap<N, N> a(ctx.in[0].data, n, n);
+  if constexpr (!Vec) {
+    const FixCMap<N, M> b(ctx.in[1].data, n, m);
+    if constexpr (N == 2) {
+      stan::math::check_multiplicable("quad_form_sym", "A", a, "B", b);
+      stan::math::check_symmetric("quad_form_sym", "A", a);
+      const FixM<M, M> ret = b.transpose() * a * b + FixM<M, M>::Zero();
+      FixMap<M, M>(ctx.out.data, m, m) = 0.5 * (ret + ret.transpose());
+    } else {
+      FixMap<M, M>(ctx.out.data, m, m) = stan::math::quad_form_sym(a, b);
+    }
+  } else {
+    const FixM<N, 1> b = Eigen::Map<const FixM<N, 1>>(ctx.in[1].data, n);
+    if (!(ctx.variant & 2u)) {
+      if constexpr (N == Eigen::Dynamic) {
+        ctx.out.data[0] = stan::math::quad_form_sym(a, b);
+      } else {
+        stan::math::check_multiplicable("quad_form_sym", "A", a, "B", b);
+        stan::math::check_symmetric("quad_form_sym", "A", a);
+        const FixM<N, 1> y = a * b + FixM<N, 1>::Zero();
+        ctx.out.data[0] = b.dot(y);
+      }
+      return;
+    }
+    stan::math::check_multiplicable("quad_form_sym", "A", a, "B", b);
+    stan::math::check_symmetric("quad_form_sym", "A", a);
+    FixM<K, K> c = quad_vec_chain<N>(a, b);
+    const FixM<K, K> sym = 0.5 * (c + c.transpose());
+    c = sym;
+    ctx.out.data[0] = c(0, 0);
   }
-  const VecD b = CMapV(ctx.in[1].data, n);
-  if (!(ctx.variant & 2u)) {
-    ctx.out.data[0] = stan::math::quad_form_sym(a, b);
-    return;
-  }
-  stan::math::check_multiplicable("quad_form_sym", "A", a, "B", b);
-  stan::math::check_symmetric("quad_form_sym", "A", a);
-  MatD c = b.transpose() * a * b;
-  const MatD sym = 0.5 * (c + c.transpose());
-  c = sym;
-  ctx.out.data[0] = c(0, 0);
 }
-void qfs_bwd(KernelCtx& ctx) {
-  const int64_t n = ctx.idata[0];
-  const bool vec = ctx.variant & 1u;
-  qf_bwd_impl(ctx, n, vec ? 1 : ctx.idata[1], vec);
+void qfs_fwd(KernelCtx& ctx) {
+  qf_shape_dispatch(
+      ctx, [&](auto N, auto M, auto Vec) { qfs_fwd_t<N, M, Vec>(ctx); });
 }
+void qfs_bwd(KernelCtx& ctx) { qf_bwd_impl(ctx, ctx.variant & 1u); }
 
 // Bind a slot as a var matrix or vector, and scatter the adjoints back
 // afterwards. Shared by the multivariate densities below and by the tail
@@ -774,22 +884,30 @@ void mnprec_bwd(KernelCtx& ctx) { mn_eval<true, kMnPrec>(ctx); }
 // rebuilding an AoS var matrix and nested tape in both sweeps. The equality
 // checks here are deliberately strict: every other activity, propto, and
 // vectorized shape stays on mn_eval's generic replay.
-inline bool mnc_native_variant(uint8_t variant, const int* idata,
-                               int64_t n_idata) {
-  return variant == 0x84u && idata != nullptr && idata[0] >= 0 &&
-         ((n_idata == 2 && idata[1] == 1) ||
-          (n_idata == 3 && idata[1] == -1 && idata[2] == -1));
+enum MncPath { kMncGeneric, kMncLegacy, kMncSmall };
+
+inline MncPath mnc_path(uint8_t variant, const int* idata, int64_t n_idata,
+                        int64_t n_in, int64_t len_y, int64_t len_mu,
+                        int64_t len_l, int64_t len_out) {
+  if (idata == nullptr || idata[0] < 0 || n_in != 3 || len_out != 1 ||
+      !((n_idata == 2 && idata[1] == 1) ||
+        (n_idata == 3 && idata[1] == -1 && idata[2] == -1)))
+    return kMncGeneric;
+  const int64_t n = idata[0];
+  if (len_y != n || len_mu != n || len_l != n * n) return kMncGeneric;
+  const unsigned mask = variant == 0 ? 7u : (variant & 7u);
+  if (n >= 1 && n <= 2 && mask != 0 && fixed_small_matrices()) return kMncSmall;
+  return variant == 0x84u ? kMncLegacy : kMncGeneric;
 }
 
-bool mnc_native_shape(const KernelCtx& ctx) {
-  if (!mnc_native_variant(ctx.variant, ctx.idata, ctx.n_idata) ||
-      ctx.n_in != 3 || ctx.out.len != 1)
-    return false;
-  const int64_t n = ctx.idata[0];
-  return ctx.in[0].len == n && ctx.in[1].len == n && ctx.in[2].len == n * n;
+MncPath mnc_path(const KernelCtx& ctx) {
+  return mnc_path(ctx.variant, ctx.idata, ctx.n_idata, ctx.n_in,
+                  ctx.n_in == 3 ? ctx.in[0].len : -1,
+                  ctx.n_in == 3 ? ctx.in[1].len : -1,
+                  ctx.n_in == 3 ? ctx.in[2].len : -1, ctx.out.len);
 }
 
-double mnc_native_fwd(KernelCtx& ctx) {
+double mnc_legacy_fwd(KernelCtx& ctx) {
   static constexpr const char* function = "multi_normal_cholesky_lpdf";
   const int64_t n = ctx.idata[0];
   CMapV y(ctx.in[0].data, n), mu(ctx.in[1].data, n);
@@ -830,12 +948,81 @@ double mnc_native_fwd(KernelCtx& ctx) {
   return logp;
 }
 
+template <int N>
+double mnc_small_fwd(KernelCtx& ctx) {
+  static constexpr const char* function = "multi_normal_cholesky_lpdf";
+  const int64_t n = ctx.idata[0];
+  const unsigned mask = ctx.variant == 0 ? 7u : (ctx.variant & 7u);
+  const bool propto = (ctx.variant & 0x80u) != 0;
+  const bool record = !values_only();
+  const FixM<N, 1> y = FixCMap<N, 1>(ctx.in[0].data, n, 1);
+  const FixM<N, 1> mu = FixCMap<N, 1>(ctx.in[1].data, n, 1);
+  const FixM<N, N> L = FixCMap<N, N>(ctx.in[2].data, n, n);
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "size of location parameter", mu.size());
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "rows of covariance parameter", L.rows());
+  stan::math::check_size_match(function, "Size of random variable", y.size(),
+                               "columns of covariance parameter", L.cols());
+  stan::math::check_finite(function, "Location parameter", mu);
+  stan::math::check_not_nan(function, "Random variable", y);
+
+  double logp = 0.0;
+  if (!propto) logp += stan::math::NEG_LOG_SQRT_TWO_PI * n;
+  const FixM<N, 1> y_minus_mu = y - mu;
+  Eigen::Matrix<double, 1, N> half;
+  FixM<N, 1> scaled_diff;
+  FixM<N, N> l_partial;
+  if (!(mask & 4u)) {
+    const MatD l_dyn = L;
+    const VecD diff_dyn = y_minus_mu;
+    const Eigen::RowVectorXd half_dyn =
+        stan::math::mdivide_left_tri<Eigen::Lower>(l_dyn, diff_dyn).transpose();
+    if (record)
+      scaled_diff = stan::math::mdivide_right_tri<Eigen::Lower>(half_dyn, l_dyn)
+                        .transpose();
+    if (!propto) logp -= stan::math::sum(stan::math::log(l_dyn.diagonal()));
+    half = half_dyn;
+  } else {
+    const FixM<N, N> inv_L = stan::math::mdivide_left_tri<Eigen::Lower>(L);
+    half = (inv_L.template triangularView<Eigen::Lower>() * y_minus_mu)
+               .transpose();
+    if (record) {
+      scaled_diff =
+          (half * inv_L.template triangularView<Eigen::Lower>()).transpose();
+      l_partial = scaled_diff * half - inv_L.transpose();
+    }
+    logp += stan::math::sum(stan::math::log(inv_L.diagonal()));
+  }
+  logp -= 0.5 * stan::math::sum(stan::math::dot_self(half));
+  if (record) {
+    FixMap<N, 1> py(ctx.scratch, n, 1), pmu(ctx.scratch + n, n, 1);
+    FixMap<N, N> pl(ctx.scratch + 2 * n, n, n);
+    py.setZero();
+    pmu.setZero();
+    pl.setZero();
+    if (mask & 1u) py -= scaled_diff;
+    if (mask & 2u) pmu += scaled_diff;
+    if (mask & 4u) pl += l_partial;
+  }
+  return logp;
+}
+
 void mnc_fwd(KernelCtx& ctx) {
-  ctx.out.data[0] = mnc_native_shape(ctx) ? mnc_native_fwd(ctx)
-                                          : mn_eval<false, kMnChol>(ctx);
+  switch (mnc_path(ctx)) {
+    case kMncSmall:
+      ctx.out.data[0] =
+          ctx.idata[0] == 1 ? mnc_small_fwd<1>(ctx) : mnc_small_fwd<2>(ctx);
+      return;
+    case kMncLegacy:
+      ctx.out.data[0] = mnc_legacy_fwd(ctx);
+      return;
+    default:
+      ctx.out.data[0] = mn_eval<false, kMnChol>(ctx);
+  }
 }
 void mnc_bwd(KernelCtx& ctx) {
-  if (!mnc_native_shape(ctx)) {
+  if (mnc_path(ctx) != kMncLegacy) {
     tail_density_bwd<3>(ctx);
     return;
   }
@@ -845,30 +1032,26 @@ void mnc_bwd(KernelCtx& ctx) {
     ctx.in_adj[2].data[i] += ctx.out_adj * ctx.scratch[i];
 }
 
-// Everything that misses the native gate replays through mn_eval, which
-// stashes one partial per input element instead of the pullback's n*n.
 int64_t mnc_scratch(const Op& op, const Slot* slots) {
   if (op.n_in != 3 || op.out < 0 || slots == nullptr || op.in[0] < 0 ||
       op.in[1] < 0 || op.in[2] < 0)
     return 0;
-  if (!mnc_native_variant(op.variant, op.idata, op.n_idata))
-    return tail_density_scratch<3>(op, slots);
-  const int64_t n = op.idata[0];
-  if (slots[op.in[0]].len != n || slots[op.in[1]].len != n ||
-      slots[op.in[2]].len != n * n || slots[op.out].len != 1)
-    return tail_density_scratch<3>(op, slots);
-  return n * n;
+  if (mnc_path(op.variant, op.idata, op.n_idata, op.n_in, slots[op.in[0]].len,
+               slots[op.in[1]].len, slots[op.in[2]].len,
+               slots[op.out].len) == kMncLegacy)
+    return op.idata[0] * op.idata[0];
+  return tail_density_scratch<3>(op, slots);
 }
 
 // ---- general matrix product: out = A * B ----------------------------------
 // idata = {rows_a, cols_a, cols_b}; either side may carry adjoints.
-void gemm_fwd(KernelCtx& ctx) {
+void gemm_fwd_dynamic(KernelCtx& ctx) {
   const int64_t ra = ctx.idata[0], ca = ctx.idata[1], cb = ctx.idata[2];
   CMapM A(ctx.in[0].data, ra, ca);
   CMapM B(ctx.in[1].data, ca, cb);
   MapM(ctx.out.data, ra, cb) = A * B;
 }
-void gemm_bwd(KernelCtx& ctx) {
+void gemm_bwd_dynamic(KernelCtx& ctx) {
   const int64_t ra = ctx.idata[0], ca = ctx.idata[1], cb = ctx.idata[2];
   CMapM A(ctx.in[0].data, ra, ca);
   CMapM B(ctx.in[1].data, ca, cb);
@@ -888,6 +1071,47 @@ void gemm_bwd(KernelCtx& ctx) {
     else
       MapM(ctx.in_adj[1].data, ca, cb) += A.transpose() * scalar_adjoint;
   }
+}
+template <int CB>
+void gemm_fwd_2x2(KernelCtx& ctx) {
+  const int64_t cb = ctx.idata[2];
+  FixCMap<2, 2> A(ctx.in[0].data, 2, 2);
+  FixCMap<2, CB> B(ctx.in[1].data, 2, cb);
+  FixMap<2, CB>(ctx.out.data, 2, cb) = (A * B).eval() + FixM<2, CB>::Zero();
+}
+template <int CB>
+void gemm_bwd_2x2(KernelCtx& ctx) {
+  const int64_t cb = ctx.idata[2];
+  FixCMap<2, 2> A(ctx.in[0].data, 2, 2);
+  FixCMap<2, CB> B(ctx.in[1].data, 2, cb);
+  FixCMap<2, CB> dO(ctx.out_adj_vec.data, 2, cb);
+  const auto scalar_adjoint = dO.unaryExpr([](double value) { return value; });
+  if (ctx.in_adj[0].data) {
+    FixMap<2, 2> dA(ctx.in_adj[0].data, 2, 2);
+    if (ctx.in_adj[1].data)
+      dA += dO * B.transpose();
+    else
+      dA += scalar_adjoint * B.transpose();
+  }
+  if (ctx.in_adj[1].data) {
+    FixMap<2, CB> dB(ctx.in_adj[1].data, 2, cb);
+    if (ctx.in_adj[0].data)
+      dB += A.transpose() * dO;
+    else
+      dB += A.transpose() * scalar_adjoint;
+  }
+}
+bool gemm_is_2x2(const KernelCtx& ctx) {
+  return fixed_small_matrices() && ctx.idata[0] == 2 && ctx.idata[1] == 2 &&
+         (ctx.idata[2] == 1 || ctx.idata[2] == 2);
+}
+void gemm_fwd(KernelCtx& ctx) {
+  if (!gemm_is_2x2(ctx)) return gemm_fwd_dynamic(ctx);
+  ctx.idata[2] == 1 ? gemm_fwd_2x2<1>(ctx) : gemm_fwd_2x2<2>(ctx);
+}
+void gemm_bwd(KernelCtx& ctx) {
+  if (!gemm_is_2x2(ctx)) return gemm_bwd_dynamic(ctx);
+  ctx.idata[2] == 1 ? gemm_bwd_2x2<1>(ctx) : gemm_bwd_2x2<2>(ctx);
 }
 
 // ---- crossprod(A): out = A' * A ------------------------------------------
@@ -1018,6 +1242,12 @@ double nid_glm_eval(KernelCtx& ctx) {
   const auto beta = as_rvar(ctx.in[3]);
   const auto sigma = as_rvar(ctx.in[4]);
   const bool one_a = ctx.in[2].len == 1, one_s = ctx.in[4].len == 1;
+  const bool legacy = ctx.variant == 0;
+  const bool sigma_data = propto && !legacy && (ctx.variant & 0x10u) == 0;
+  const bool others_data = propto && !legacy && (ctx.variant & 0xfu) == 0;
+  if (!values_only() && sigma_data)
+    for (int k = others_data ? 2 : 4; k <= 4; ++k)
+      if (s.buf[k]) std::fill_n(s.buf[k], ctx.in[k].len, 0.0);
   auto call = [&](const auto& y, const auto& x, const auto& a,
                   const auto& scale) {
     record_probability_call([&] {
@@ -1026,15 +1256,35 @@ double nid_glm_eval(KernelCtx& ctx) {
                  : stan::math::normal_id_glm_lpdf<false>(y, x, a, beta, scale);
     });
   };
-  auto dispatch = [&](const auto& y, const auto& x) {
-    if (one_a && one_s)
-      call(y, x, alpha(0), sigma(0));
-    else if (one_a)
-      call(y, x, alpha(0), sigma);
-    else if (one_s)
-      call(y, x, alpha, sigma(0));
+  auto call_data_scale = [&](const auto& y, const auto& x, const auto& a,
+                             const auto& b, const auto& scale) {
+    record_probability_call([&] {
+      return stan::math::normal_id_glm_lpdf<true>(y, x, a, b, scale);
+    });
+  };
+  auto with_scale_data = [&](auto&& f) {
+    if (one_s)
+      f(ctx.in[4].data[0]);
     else
+      f(CMapV(ctx.in[4].data, ctx.in[4].len));
+  };
+  auto dispatch = [&](const auto& y, const auto& x) {
+    if (sigma_data) {
+      with_scale_data([&](const auto& scale) {
+        if (one_a)
+          call_data_scale(y, x, alpha(0), beta, scale);
+        else
+          call_data_scale(y, x, alpha, beta, scale);
+      });
+    } else if (one_a && one_s) {
+      call(y, x, alpha(0), sigma(0));
+    } else if (one_a) {
+      call(y, x, alpha(0), sigma);
+    } else if (one_s) {
+      call(y, x, alpha, sigma(0));
+    } else {
       call(y, x, alpha, sigma);
+    }
   };
   const bool row_x = ctx.n_idata >= 5 && ctx.idata[4] == 1;
   auto pick_x = [&](const auto& y) {
@@ -1049,7 +1299,28 @@ double nid_glm_eval(KernelCtx& ctx) {
       dispatch(y, Xd);
     }
   };
-  if (y_var) {
+  if (sigma_data && others_data) {
+    const CMapV beta_data(ctx.in[3].data, ctx.in[3].len);
+    auto all_data = [&](const auto& y, const auto& x) {
+      with_scale_data([&](const auto& scale) {
+        if (one_a)
+          call_data_scale(y, x, ctx.in[2].data[0], beta_data, scale);
+        else
+          call_data_scale(y, x, CMapV(ctx.in[2].data, ctx.in[2].len), beta_data,
+                          scale);
+      });
+    };
+    auto pick_data_x = [&](const auto& y) {
+      if (row_x)
+        all_data(y, Xd.row(0));
+      else
+        all_data(y, Xd);
+    };
+    if (one_y)
+      pick_data_x(ctx.in[0].data[0]);
+    else
+      pick_data_x(yd);
+  } else if (y_var) {
     if (one_y)
       pick_x(yv(0));
     else
@@ -1377,6 +1648,22 @@ double ordered_eval(KernelCtx& ctx) {
   const int cuts_encoded = ctx.idata[ctx.n_idata - 1];
   const bool propto = (ctx.variant & 0x80u) != 0;
   std::vector<int> y(ctx.idata, ctx.idata + N);
+  if constexpr (Kind == kOrderedLogistic) {
+    if (propto && (ctx.variant & 0x3u) == 0) {
+      if constexpr (Grad) return 0.0;
+      Eigen::VectorXd location =
+          Eigen::Map<const Eigen::VectorXd>(ctx.in[0].data, ctx.in[0].len);
+      auto data_cuts = mvt_vectors<double>(ctx.in[1], K, cuts_encoded);
+      double value = 0;
+      with_mvt_argument(data_cuts, cuts_encoded, [&](const auto& cutpoints) {
+        value = ctx.in[0].len == 1 ? stan::math::ordered_logistic_lpmf<true>(
+                                         y, location(0), cutpoints)
+                                   : stan::math::ordered_logistic_lpmf<true>(
+                                         y, location, cutpoints);
+      });
+      return value;
+    }
+  }
   stan::math::nested_rev_autodiff nested;
   using stan::math::var;
   // ordered_probit does not condition its summands on propto or the scalar
@@ -1410,40 +1697,123 @@ double ordered_eval(KernelCtx& ctx) {
     return finish_tail_density<Grad>(ctx, out, lambda, cuts);
 }
 
-// wiener(y | alpha, tau, beta, delta): five real arguments, and every one
-// of them vectorizes in the language. A length-1 slot must enter stan-math
-// as a scalar: its sequence views broadcast scalars but require vectors to
-// match sizes, and the conformance sweep caught the old scalar-only tail
-// silently evaluating every observation with element 0's parameters.
-template <bool Grad>
-double wiener_eval(KernelCtx& ctx) {
-  const bool propto = (ctx.variant & 0x80u) != 0;
-  stan::math::nested_rev_autodiff nested;
-  using stan::math::var;
-  using Arg = std::variant<var, VarV>;
-  auto load = [&](int k) -> Arg {
-    if (ctx.in[k].len == 1) return var(ctx.in[k].data[0]);
-    return tail_v(ctx, k, ctx.in[k].len);
-  };
-  Arg y = load(0), alpha = load(1), tau = load(2), beta = load(3),
-      delta = load(4);
-  var out = std::visit(
-      [&](const auto&... a) -> var {
-        return propto ? stan::math::wiener_lpdf<true>(a...)
-                      : stan::math::wiener_lpdf<false>(a...);
-      },
-      y, alpha, tau, beta, delta);
-  const double value = out.val();
-  if constexpr (Grad) {
-    var seeded = out * ctx.out_adj;
-    stan::math::grad(seeded.vi_);
-    int slot = 0;
-    for (const Arg* p : {&y, &alpha, &tau, &beta, &delta}) {
-      std::visit([&](const auto& a) { tail_scatter(ctx, slot, a); }, *p);
-      ++slot;
+// With every argument of length 1 the density is called on scalars. Otherwise a
+// length-1 argument is spread to the common length as one shared variable:
+// stan-math broadcasts scalars, not one-element vectors.
+using WienerData = Eigen::Map<const Eigen::VectorXd>;
+using WienerVar = stan::arena_t<VarV>;
+template <bool Scalar, bool Active>
+using WienerArg =
+    std::conditional_t<Active,
+                       std::conditional_t<Scalar, stan::math::var, WienerVar>,
+                       std::conditional_t<Scalar, double, WienerData>>;
+unsigned wiener_activity(const KernelCtx& ctx) {
+  const unsigned mask = ctx.variant & 0x1fu;
+  return mask ? mask : 0x1fu;
+}
+int64_t wiener_extent(const KernelCtx& ctx) {
+  int64_t n = 1;
+  for (int k = 0; k < 5; ++k)
+    if (ctx.in[k].len != 1) n = ctx.in[k].len;
+  return n;
+}
+template <bool Scalar, bool Active>
+WienerArg<Scalar, Active> wiener_load(const KernelCtx& ctx, int k, int64_t n) {
+  const double* d = ctx.in[k].data;
+  if constexpr (Scalar) {
+    if constexpr (Active)
+      return stan::math::var(d[0]);
+    else
+      return d[0];
+  } else {
+    const bool spread = ctx.in[k].len == 1;
+    const int64_t len = spread ? n : ctx.in[k].len;
+    if constexpr (!Active) {
+      if (!spread) return WienerData(d, len);
+      double* wide =
+          stan::math::ChainableStack::instance_->memalloc_.alloc_array<double>(
+              len);
+      std::fill_n(wide, len, d[0]);
+      return WienerData(wide, len);
+    } else {
+      WienerVar v(len);
+      if (spread)
+        v.setConstant(stan::math::var(d[0]));
+      else
+        for (int64_t i = 0; i < len; ++i) v(i) = d[i];
+      return v;
     }
   }
+}
+double wiener_adjoint(const stan::math::var& x, int64_t) { return x.adj(); }
+double wiener_adjoint(const WienerVar& v, int64_t i) {
+  return v.size() ? v(i).adj() : 0.0;
+}
+enum class WienerPass { Value, Partials, Seeded };
+template <typename Arg>
+void wiener_collect(KernelCtx& ctx, int k, const Arg& a, WienerPass pass,
+                    double*& stash) {
+  constexpr bool active =
+      std::is_same_v<Arg, stan::math::var> || std::is_same_v<Arg, WienerVar>;
+  const int64_t len = ctx.in[k].len;
+  if (pass == WienerPass::Partials) {
+    for (int64_t i = 0; i < len; ++i) {
+      if constexpr (active)
+        stash[i] = wiener_adjoint(a, len == 1 ? 0 : i);
+      else
+        stash[i] = 0.0;
+    }
+    stash += len;
+  } else if constexpr (active) {
+    if (ctx.in_adj[k].data)
+      for (int64_t i = 0; i < len; ++i)
+        ctx.in_adj[k].data[i] += wiener_adjoint(a, len == 1 ? 0 : i);
+  }
+}
+template <bool Scalar, unsigned Mask>
+double wiener_eval(KernelCtx& ctx, WienerPass pass) {
+  stan::math::nested_rev_autodiff nested;
+  using stan::math::var;
+  const int64_t n = Scalar ? 1 : wiener_extent(ctx);
+  const WienerArg<Scalar, (Mask & 1u) != 0> y =
+      wiener_load<Scalar, (Mask & 1u) != 0>(ctx, 0, n);
+  const WienerArg<Scalar, (Mask & 2u) != 0> alpha =
+      wiener_load<Scalar, (Mask & 2u) != 0>(ctx, 1, n);
+  const WienerArg<Scalar, (Mask & 4u) != 0> tau =
+      wiener_load<Scalar, (Mask & 4u) != 0>(ctx, 2, n);
+  const WienerArg<Scalar, (Mask & 8u) != 0> beta =
+      wiener_load<Scalar, (Mask & 8u) != 0>(ctx, 3, n);
+  const WienerArg<Scalar, (Mask & 16u) != 0> delta =
+      wiener_load<Scalar, (Mask & 16u) != 0>(ctx, 4, n);
+  var out = stan::math::wiener_lpdf<false>(y, alpha, tau, beta, delta);
+  const double value = out.val();
+  if (pass == WienerPass::Value) return value;
+  if (pass == WienerPass::Seeded) {
+    var seeded = out * ctx.out_adj;
+    stan::math::grad(seeded.vi_);
+  } else {
+    stan::math::grad(out.vi_);
+  }
+  double* stash = ctx.scratch;
+  wiener_collect(ctx, 0, y, pass, stash);
+  wiener_collect(ctx, 1, alpha, pass, stash);
+  wiener_collect(ctx, 2, tau, pass, stash);
+  wiener_collect(ctx, 3, beta, pass, stash);
+  wiener_collect(ctx, 4, delta, pass, stash);
   return value;
+}
+template <bool Scalar, unsigned... Mask>
+double wiener_select(KernelCtx& ctx, unsigned active, WienerPass pass,
+                     std::integer_sequence<unsigned, Mask...>) {
+  using Eval = double (*)(KernelCtx&, WienerPass);
+  static constexpr Eval table[] = {&wiener_eval<Scalar, Mask>...};
+  return table[active](ctx, pass);
+}
+double wiener_run(KernelCtx& ctx, unsigned active, WienerPass pass) {
+  const auto masks = std::make_integer_sequence<unsigned, 32>{};
+  return wiener_extent(ctx) == 1
+             ? wiener_select<true>(ctx, active, pass, masks)
+             : wiener_select<false>(ctx, active, pass, masks);
 }
 
 #define STANLI_TAIL_KERNEL(name, fn, kind)                                    \
@@ -1464,26 +1834,34 @@ void ologistic_fwd(KernelCtx& ctx) {
   // validation semantics are unchanged.
   if (ctx.n_idata < 4 ||
       ctx.idata[ctx.n_idata - 3] != kVectorizedDensityLayoutMarker ||
-      ctx.idata[ctx.n_idata - 1] >= 0) {
+      ctx.idata[ctx.n_idata - 1] >= 0 ||
+      ((ctx.variant & 0x80u) && (ctx.variant & 0x3u) == 0)) {
     ctx.out.data[0] = ordered_eval<false, kOrderedLogistic>(ctx);
     return;
   }
-  sink s = recorded_tail_sink<2>(ctx);
-  sink_scope active(s);
-  const std::vector<int> y(ctx.idata, ctx.idata + ctx.n_idata - 3);
-  const auto cuts = as_rvar(ctx.in[1]);
-  const auto call = [&](const auto& location) {
-    record_probability_call([&] {
-      return (ctx.variant & 0x80u)
-                 ? stan::math::ordered_logistic_lpmf<true>(y, location, cuts)
-                 : stan::math::ordered_logistic_lpmf<false>(y, location, cuts);
-    });
-  };
-  if (ctx.in[0].len == 1)
-    call(rvar(ctx.in[0].data[0]));
-  else
-    call(as_rvar(ctx.in[0]));
-  ctx.out.data[0] = s.value;
+  if (dens::fused_density_active()) {
+    dens::ordered_logistic_lpmf_fused(ctx);
+    return;
+  }
+  if constexpr (!dens::kFusedOnly) {
+    sink s = recorded_tail_sink<2>(ctx);
+    sink_scope active(s);
+    const std::vector<int> y(ctx.idata, ctx.idata + ctx.n_idata - 3);
+    const auto cuts = as_rvar(ctx.in[1]);
+    const auto call = [&](const auto& location) {
+      record_probability_call([&] {
+        return (ctx.variant & 0x80u)
+                   ? stan::math::ordered_logistic_lpmf<true>(y, location, cuts)
+                   : stan::math::ordered_logistic_lpmf<false>(y, location,
+                                                              cuts);
+      });
+    };
+    if (ctx.in[0].len == 1)
+      call(rvar(ctx.in[0].data[0]));
+    else
+      call(as_rvar(ctx.in[0]));
+    ctx.out.data[0] = s.value;
+  }
 }
 void ologistic_bwd(KernelCtx& ctx) {
   if (ctx.idata[ctx.n_idata - 1] >= 0) {
@@ -1596,60 +1974,109 @@ void oprobit_bwd(KernelCtx& ctx) {
 int64_t oprobit_scratch(const Op& op, const Slot* slots) {
   return 5 * slots[op.in[0]].len + slots[op.in[1]].len;
 }
-// Scalar observations with a fixed outcome need derivatives only
-// for boundary, nondecision time, bias and drift. Keep those types active
-// (including under propto), and retain their unit partials from a single Stan
-// Math tape.
-bool wiener_fixed_observation(const KernelCtx& ctx) {
-  if (ctx.in_adj[0].data) return false;
-  for (int k = 0; k < 5; ++k)
-    if (ctx.in[k].len != 1) return false;
-  return true;
-}
 void wiener_fwd(KernelCtx& ctx) {
-  if (!wiener_fixed_observation(ctx)) {
-    ctx.out.data[0] = wiener_eval<false>(ctx);
-    return;
-  }
-  stan::math::nested_rev_autodiff nested;
-  using stan::math::var;
-  var alpha = ctx.in[1].data[0], tau = ctx.in[2].data[0],
-      beta = ctx.in[3].data[0], delta = ctx.in[4].data[0];
-  const double y = ctx.in[0].data[0];
-  var out = (ctx.variant & 0x80u)
-                ? stan::math::wiener_lpdf<true>(y, alpha, tau, beta, delta)
-                : stan::math::wiener_lpdf<false>(y, alpha, tau, beta, delta);
-  ctx.out.data[0] = out.val();
-  if (!values_only()) {
-    stan::math::grad(out.vi_);
-    ctx.scratch[0] = alpha.adj();
-    ctx.scratch[1] = tau.adj();
-    ctx.scratch[2] = beta.adj();
-    ctx.scratch[3] = delta.adj();
-  }
+  ctx.out.data[0] = values_only() ? wiener_run(ctx, 0, WienerPass::Value)
+                                  : wiener_run(ctx, wiener_activity(ctx),
+                                               WienerPass::Partials);
 }
 void wiener_bwd(KernelCtx& ctx) {
-  // A unit seed reuses the same reverse arithmetic. Weighted replay must
-  // propagate its seed through that arithmetic: post-scaling unit partials
-  // can hide intermediate overflow or change underflow/cancellation.
-  if (!wiener_fixed_observation(ctx) || ctx.out_adj != 1.0) {
-    wiener_eval<true>(ctx);
+  unsigned active = wiener_activity(ctx);
+  for (int k = 0; k < 5; ++k)
+    if (ctx.in_adj[k].data) active |= 1u << k;
+  bool reusable = std::isfinite(ctx.out_adj) && active == wiener_activity(ctx);
+  int64_t total = 0;
+  for (int k = 0; k < 5; ++k) total += ctx.in[k].len;
+  for (int64_t i = 0; reusable && i < total; ++i)
+    reusable = std::isfinite(ctx.scratch[i]);
+  if (!reusable) {
+    wiener_run(ctx, active, WienerPass::Seeded);
     return;
   }
-  for (int j = 0; j < 4; ++j)
-    if (!std::isfinite(ctx.scratch[j])) {
-      wiener_eval<true>(ctx);
-      return;
-    }
-  const int inputs[] = {1, 2, 3, 4};
-  for (int j = 0; j < 4; ++j)
-    if (ctx.in_adj[inputs[j]].data)
-      ctx.in_adj[inputs[j]].data[0] += ctx.out_adj * ctx.scratch[j];
+  const double* stash = ctx.scratch;
+  for (int k = 0; k < 5; ++k) {
+    if (ctx.in_adj[k].data)
+      for (int64_t i = 0; i < ctx.in[k].len; ++i)
+        ctx.in_adj[k].data[i] += ctx.out_adj * stash[i];
+    stash += ctx.in[k].len;
+  }
 }
 int64_t wiener_scratch(const Op& op, const Slot* slots) {
-  for (int k = 0; k < 5; ++k)
-    if (slots[op.in[k]].len != 1) return 0;
-  return 4;
+  int64_t total = 0;
+  for (int k = 0; k < 5; ++k) total += slots[op.in[k]].len;
+  return total;
+}
+
+// wiener(y | a, t0, w, v, sv[, sw, st0], precision): the five- and
+// seven-parameter densities. Input 0 holds the real arguments argument-major,
+// one entry per lane; input 1 is the derivative precision. idata: argument
+// count, lane count, active-argument mask, propto. Scratch keeps the partials.
+template <typename Y, typename P>
+stan::math::var wiener_packed_call(bool propto, int nargs, const Y& y,
+                                   const std::vector<P>& p, double precision) {
+  if (nargs == 6)
+    return propto ? stan::math::wiener_lpdf<true>(y, p[0], p[1], p[2], p[3],
+                                                  p[4], precision)
+                  : stan::math::wiener_lpdf<false>(y, p[0], p[1], p[2], p[3],
+                                                   p[4], precision);
+  return propto ? stan::math::wiener_lpdf<true>(y, p[0], p[1], p[2], p[3], p[4],
+                                                p[5], p[6], precision)
+                : stan::math::wiener_lpdf<false>(y, p[0], p[1], p[2], p[3],
+                                                 p[4], p[5], p[6], precision);
+}
+void wiener_packed_fwd(KernelCtx& ctx) {
+  const int nargs = ctx.idata[0];
+  const int64_t lanes = ctx.idata[1];
+  const unsigned active = (unsigned)ctx.idata[2];
+  const bool propto = ctx.idata[3] != 0;
+  const int64_t width = nargs * lanes;
+  double* partials = values_only() ? nullptr : ctx.scratch;
+  if (partials) std::fill_n(partials, width, 0.0);
+  if (propto && active == 0) {
+    ctx.out.data[0] = 0.0;
+    return;
+  }
+  const double precision = ctx.in[1].data[0];
+  const double* in = ctx.in[0].data;
+  const bool y_active = (active & 1u) != 0;
+  stan::math::nested_rev_autodiff nested;
+  using stan::math::var;
+  var out;
+  if (lanes == 1) {
+    std::vector<var> p;
+    for (int k = 1; k < nargs; ++k) p.emplace_back(in[k]);
+    var y = in[0];
+    out = y_active ? wiener_packed_call(propto, nargs, y, p, precision)
+                   : wiener_packed_call(propto, nargs, in[0], p, precision);
+    ctx.out.data[0] = out.val();
+    if (!partials) return;
+    stan::math::grad(out.vi_);
+    if (y_active) partials[0] = y.adj();
+    for (int k = 1; k < nargs; ++k) partials[k] = p[k - 1].adj();
+    return;
+  }
+  std::vector<VarV> p(nargs - 1, VarV(lanes));
+  for (int k = 1; k < nargs; ++k)
+    for (int64_t i = 0; i < lanes; ++i) p[k - 1](i) = in[k * lanes + i];
+  const Eigen::Map<const Eigen::VectorXd> y_data(in, lanes);
+  VarV y = y_data.cast<var>();
+  out = y_active ? wiener_packed_call(propto, nargs, y, p, precision)
+                 : wiener_packed_call(propto, nargs, Eigen::VectorXd(y_data), p,
+                                      precision);
+  ctx.out.data[0] = out.val();
+  if (!partials) return;
+  stan::math::grad(out.vi_);
+  for (int64_t i = 0; i < lanes; ++i) {
+    if (y_active) partials[i] = y(i).adj();
+    for (int k = 1; k < nargs; ++k) partials[k * lanes + i] = p[k - 1](i).adj();
+  }
+}
+void wiener_packed_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  for (int64_t i = 0; i < ctx.in[0].len; ++i)
+    ctx.in_adj[0].data[i] += ctx.out_adj * ctx.scratch[i];
+}
+int64_t wiener_packed_scratch(const Op& op, const Slot* slots) {
+  return slots[op.in[0]].len;
 }
 
 // ---- the last five ------------------------------------------------------
@@ -1688,6 +2115,26 @@ double tglm_eval(KernelCtx& ctx) {
   const unsigned scalar_mask =
       scalar_layout ? (unsigned)ctx.idata[ctx.n_idata - 1] : 0u;
   const bool propto = (ctx.variant & 0x80u) != 0;
+  if constexpr (Kind == kBinomLogitGlm) {
+    if (propto && (ctx.variant & 0x7u) == 0) {
+      std::vector<int> nn(ctx.idata, ctx.idata + rows);
+      std::vector<int> NN(ctx.idata + rows, ctx.idata + 2 * rows);
+      const CMapM Xd(ctx.in[0].data, rows, cols);
+      const CMapV beta_d(ctx.in[2].data, cols);
+      if (!values_only())
+        std::fill_n(ctx.scratch, ctx.in[0].len + ctx.in[1].len + ctx.in[2].len,
+                    0.0);
+      return with_glm_integer(nn, scalar_mask & 1u, [&](const auto& n_arg) {
+        return with_glm_integer(NN, scalar_mask & 2u, [&](const auto& N_arg) {
+          if (ctx.in[1].len == 1)
+            return stan::math::binomial_logit_glm_lpmf<true>(
+                n_arg, N_arg, Xd, ctx.in[1].data[0], beta_d);
+          return stan::math::binomial_logit_glm_lpmf<true>(
+              n_arg, N_arg, Xd, CMapV(ctx.in[1].data, rows), beta_d);
+        });
+      });
+    }
+  }
   stan::math::nested_rev_autodiff nested;
   using stan::math::var;
   VarM X = tail_m(ctx, 0, rows, cols);
@@ -1748,6 +2195,19 @@ void clglm_fwd(KernelCtx& ctx) {
   std::vector<int> y(ctx.idata, ctx.idata + rows);
   sink s = recorded_tail_sink<3>(ctx);
   sink_scope active(s);
+  if ((ctx.variant & 0x80u) && (ctx.variant & 0x7u) == 0) {
+    const CMapM Xd(ctx.in[0].data, rows, cols);
+    const CMapV alpha_d(ctx.in[1].data, ctx.in[1].len);
+    const CMapM beta_d(ctx.in[2].data, cols, ctx.in[2].len / cols);
+    with_glm_integer(y, scalar_y, [&](const auto& outcome) {
+      record_probability_call([&] {
+        return stan::math::categorical_logit_glm_lpmf<true>(outcome, Xd,
+                                                            alpha_d, beta_d);
+      });
+    });
+    ctx.out.data[0] = s.value;
+    return;
+  }
   const auto X = as_rvar_matrix(ctx.in[0], rows, cols);
   const auto alpha = as_rvar(ctx.in[1]);
   const auto beta = as_rvar_matrix(ctx.in[2], cols, ctx.in[2].len / cols);
@@ -1775,6 +2235,19 @@ void olglm_fwd(KernelCtx& ctx) {
   std::vector<int> y(ctx.idata, ctx.idata + rows);
   sink s = recorded_tail_sink<3>(ctx);
   sink_scope active(s);
+  if ((ctx.variant & 0x80u) && (ctx.variant & 0x7u) == 0) {
+    const CMapM Xd(ctx.in[0].data, rows, cols);
+    const CMapV beta_d(ctx.in[1].data, ctx.in[1].len);
+    const CMapV cuts_d(ctx.in[2].data, ctx.in[2].len);
+    with_glm_integer(y, scalar_y, [&](const auto& outcome) {
+      record_probability_call([&] {
+        return stan::math::ordered_logistic_glm_lpmf<true>(outcome, Xd, beta_d,
+                                                           cuts_d);
+      });
+    });
+    ctx.out.data[0] = s.value;
+    return;
+  }
   const auto X = as_rvar_matrix(ctx.in[0], rows, cols);
   const auto beta = as_rvar(ctx.in[1]), cuts = as_rvar(ctx.in[2]);
   with_glm_integer(y, scalar_y, [&](const auto& outcome) {
@@ -1875,6 +2348,9 @@ void register_matrix_kernels() {
                   Kernel{oprobit_fwd, oprobit_bwd, oprobit_scratch});
   register_kernel(OP_WIENER_LPDF,
                   Kernel{wiener_fwd, wiener_bwd, wiener_scratch});
+  register_kernel(
+      OP_WIENER_PACKED_LPDF,
+      Kernel{wiener_packed_fwd, wiener_packed_bwd, wiener_packed_scratch});
 #define STANLI_REGISTER_TAIL_CDF(code, fn, nreal, tier) \
   register_kernel(code, Kernel{fn##_fwd, fn##_bwd, nullptr});
   STANLI_TAIL_CDF_LIST(STANLI_REGISTER_TAIL_CDF)

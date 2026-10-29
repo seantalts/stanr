@@ -1,5 +1,4 @@
 #include "lower_internal.hpp"
-#include "reroll_plan.hpp"
 
 namespace stanli {
 namespace lower_detail {
@@ -47,8 +46,6 @@ static bool bounded_while_guard(const mir::Expr& e) {
     if (!bounded_while_guard(a)) return false;
   return true;
 }
-
-#include "lower_symbolic_lane.inc"
 
 bool Lowering::expr_has_jacobian(const mir::Expr& e) {
   if (e.kind == mir::Expr::FunApp) {
@@ -110,9 +107,17 @@ bool Lowering::while_sizes_from_loop_state(const mir::Stmt& s) {
 // the caller.
 bool Lowering::unroll_while(const mir::Stmt& s) {
   for (long trip = 0; trip < kWhileUnrollLimit; ++trip) {
-    auto evaluated = try_eval_pure(s.cond);
-    if (!evaluated) return false;
-    if (evaluated->r.at(0) == 0.0) return true;
+    bool open = false;
+    if (auto evaluated = try_eval_pure(s.cond)) {
+      open = evaluated->r.at(0) != 0.0;
+    } else {
+      try {
+        open = eval_int(s.cond) != 0;
+      } catch (const CompileError&) {
+        return false;
+      }
+    }
+    if (!open) return true;
     try {
       for (const auto& child : s.body) lower_stmt(child);
     } catch (LoopContinue&) {
@@ -141,6 +146,15 @@ bool Lowering::scan_block(const mir::Stmt& s,
   // view the query threw here and sent the whole write_array section to
   // the interpreter.
   std::vector<std::pair<std::string, std::optional<DeclView>>> local_views;
+  // Their values too: a local declared again on each pass of an enclosing
+  // loop must not be read with the previous pass's value or extent.
+  struct LocalValue {
+    std::string name;
+    std::optional<DataMap::Entry> data;
+    std::optional<Val> value;
+  };
+  std::vector<LocalValue> local_values;
+  std::set<std::string> local_containers;
   const auto restore = [&] {
     int_env = saved;
     for (auto it = local_views.rbegin(); it != local_views.rend(); ++it) {
@@ -149,6 +163,44 @@ bool Lowering::scan_block(const mir::Stmt& s,
       else
         decls.erase(it->first);
     }
+    for (auto it = local_values.rbegin(); it != local_values.rend(); ++it) {
+      if (it->data)
+        td.env()[it->name] = *it->data;
+      else
+        td.env().erase(it->name);
+      if (it->value)
+        scope[it->name] = *it->value;
+      else
+        scope.erase(it->name);
+    }
+  };
+  // A value the scan cannot work out yet (one written inside a nested block,
+  // say) stays unknown; lowering evaluates it in order.
+  const auto set_local_int = [&](const std::string& name,
+                                 const mir::Expr* rhs) {
+    int_env.erase(name);
+    if (!rhs) return;
+    try {
+      int_env[name] = eval_int(*rhs);
+    } catch (const CompileError&) {
+    }
+  };
+  // Container locals are mirrored by running their declaration and every
+  // assignment to them in the data interpreter, which reads loop integers
+  // from int_env. One it cannot run, or one that would draw, is dropped.
+  const auto mirror_value = [&](const mir::Stmt& st, const std::string& name) {
+    bool effectful =
+        expr_effectful(st.kind == mir::Stmt::Decl ? st.init : st.rhs);
+    for (const auto& index : st.lhs_idx)
+      effectful = effectful || expr_effectful(index);
+    if (!effectful) {
+      try {
+        td.exec(st);
+        return;
+      } catch (const std::exception&) {
+      }
+    }
+    td.env().erase(name);
   };
   bool found = false;
   try {
@@ -159,16 +211,15 @@ bool Lowering::scan_block(const mir::Stmt& s,
       }
       if (child.kind == mir::Stmt::Decl && child.decl_type.base == "SInt") {
         local_ints.insert(child.decl_id);
-        int_env.erase(child.decl_id);
-        if (child.has_init) int_env[child.decl_id] = eval_int(child.init);
+        set_local_int(child.decl_id, child.has_init ? &child.init : nullptr);
       } else if (child.kind == mir::Stmt::Assignment && child.lhs_idx.empty() &&
                  local_ints.count(child.lhs)) {
-        int_env[child.lhs] = eval_int(child.rhs);
+        set_local_int(child.lhs, &child.rhs);
       } else if (child.kind == mir::Stmt::Decl &&
                  !child.decl_type.base.empty()) {
         try {
           DeclView sh;
-          sh.len = sized_len(child.decl_type);
+          sh.len = sized_len(child.decl_type, nullptr, nullptr, child.decl_id);
           sh.si = view_of(child.decl_type);
           const auto old = decls.find(child.decl_id);
           local_views.emplace_back(child.decl_id,
@@ -180,6 +231,26 @@ bool Lowering::scan_block(const mir::Stmt& s,
           // A runtime-sized local answers nothing here; the scan went on
           // without it before and still does.
         }
+        const auto data = td.env().find(child.decl_id);
+        const auto value = scope.find(child.decl_id);
+        local_values.push_back(
+            {child.decl_id,
+             data == td.env().end()
+                 ? std::nullopt
+                 : std::optional<DataMap::Entry>(data->second),
+             value == scope.end() ? std::nullopt
+                                  : std::optional<Val>(value->second)});
+        scope.erase(child.decl_id);
+        local_containers.insert(child.decl_id);
+        mirror_value(child, child.decl_id);
+      } else if (child.kind == mir::Stmt::Assignment &&
+                 local_containers.count(child.lhs)) {
+        mirror_value(child, child.lhs);
+      } else if (!local_containers.empty()) {
+        std::vector<std::string> writes;
+        assigned_names(child, &writes);
+        for (const auto& name : writes)
+          if (local_containers.count(name)) td.env().erase(name);
       }
     }
   } catch (...) {
@@ -226,9 +297,9 @@ bool Lowering::needs_runtime_control(const mir::Stmt& s) {
       lo = eval_int(s.lower);
       hi = eval_int(s.upper);
     } catch (const CompileError&) {
-      if (needs_runtime_value(s.lower) || needs_runtime_value(s.upper))
-        return true;
-      throw;
+      // Including a bound this scan cannot work out yet: the caller then
+      // tries a register program and otherwise lowers in order.
+      return true;
     }
     if (lo > hi) return false;
     const auto old = int_env.find(s.loopvar);
@@ -309,18 +380,16 @@ bool Lowering::peel_terminal_return(mir::Stmt* s, mir::Expr* value) {
     return peel_terminal_return(&s->body.back(), value);
   return false;
 }
-// Compile `s` (a statement region) or `e` (a ternary) into a program.
-void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
-                            IslandRegion* reg, Range* expr_out,
-                            std::shared_ptr<IslandProg>* prog_out) {
-  auto prog = std::make_shared<IslandProg>();
-  ProgramCompiler c{*prog, fun_defs};
-  c.in_write_array = in_write_array;
-  c.checked_region = s;
-  // Non-returning statement calls may print or reject. A register program
-  // would replay them during reverse mode, so ProgramCompiler refuses them
-  // until necessity islands have an execute-once effect path.
-  for (const auto& [name, v] : int_env) c.ints[name] = {v};
+void Lowering::configure_island_compiler(ProgramCompiler& c,
+                                         IslandProg& prog_ref,
+                                         IslandRegion& region,
+                                         const std::set<std::string>& names,
+                                         const mir::Stmt* s) {
+  IslandProg* const prog = &prog_ref;
+  IslandRegion* const reg = &region;
+  for (const std::string& name : names)
+    if (const auto found = int_env.find(name); found != int_env.end())
+      c.ints[name] = {found->second};
   // Data the region reads as a compile-time integer, answered by the
   // same interpreter that answers a size expression. The region has
   // already resolved the indices, so what arrives is a literal read of a
@@ -357,21 +426,24 @@ void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
   c.lower_higher_order = [&](const mir::Expr& x, Range* result) {
     return lower_program_higher_order(c, x, result);
   };
-  if (!in_write_array) {
-    c.bind_target = [&](Range* r) {
-      const int slot = current_target_slot();
-      r->reg = c.alloc(1);
-      r->len = 1;
-      prog->ins.push_back(IslandProg::LiveIn{r->reg, 1});
-      reg->in_slots.push_back(slot);
-      return true;
-    };
+  {
+    std::vector<std::string> region_assigned;
+    if (s) assigned_names(*s, &region_assigned);
+    const std::set<std::string> reassigned(region_assigned.begin(),
+                                           region_assigned.end());
+    for (const std::string& name : names) {
+      const auto found = scope.find(name);
+      if (found == scope.end()) continue;
+      const Val& value = found->second;
+      if (reassigned.count(name) || value.slot < 0 ||
+          value.slot >= (int)g.slots.size() || !is_scalar(value))
+        continue;
+      const DataMap::Entry* known = observation(value);
+      if (known && !known->is_int && known->r.size() == 1)
+        c.known_reals[name] = known->r[0];
+    }
   }
-  std::set<std::string> outer_names;
-  for (const auto& [name, value] : scope) outer_names.insert(name);
-  for (const auto& [name, value] : decls) outer_names.insert(name);
-  const std::set<std::string> outer_int_names = int_locals;
-  c.bind_extern = [&](const std::string& name, Range* r) {
+  c.bind_extern = [this, &c, prog, reg](const std::string& name, Range* r) {
     auto sc = scope.find(name);
     int slot = sc != scope.end() ? sc->second.slot : env_slot(name);
     if (slot < 0) slot = uninitialized_decl_slot(name);
@@ -394,6 +466,97 @@ void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
     }
     return true;
   };
+}
+void Lowering::finalize_island_program(IslandProg& prog, bool native,
+                                       bool keep_every_clear,
+                                       bool propagate_copies) {
+  if (propagate_copies && native) {
+    const IslandProg before = prog;
+    finalize_island_program_once(prog, native, keep_every_clear, true);
+    if (prog.native_adj) return;
+    static_cast<IslandProg&>(prog) = before;
+  }
+  finalize_island_program_once(prog, native, keep_every_clear, false);
+}
+void Lowering::finalize_island_program_once(IslandProg& prog, bool native,
+                                            bool keep_every_clear,
+                                            bool propagate_copies) {
+  // Forward-only branches can record the executed path for generated
+  // adjoints. Unsupported derivatives and loops retain the replay.
+  // The register compactor's liveness analysis is straight-line (with
+  // forward branches as barriers).  A while adds a back edge, so retaining
+  // the uncompact program is the correctness-first choice: a state register
+  // written in one iteration is necessarily live at the next head.
+  bool has_back_edge = false;
+  bool has_unmodelled_ranges = false;
+  for (size_t pc = 0; pc < prog.code.size(); ++pc) {
+    const Program::Instr& instr = prog.code[pc];
+    const bool jump = instr.code == Program::JZ || instr.code == Program::JMP;
+    if (!jump && program_code_spec(instr.code).has(kProgramNoAdjoint))
+      has_unmodelled_ranges = true;
+    if (jump && instr.dst <= static_cast<int>(pc)) has_back_edge = true;
+  }
+  if (propagate_copies && !has_back_edge && !has_unmodelled_ranges) {
+    std::vector<std::pair<int, int>> seeded;
+    for (const auto& input : prog.ins)
+      seeded.emplace_back(input.reg, input.len);
+    propagate_program_copies(prog, seeded);
+  }
+  if (!has_back_edge && !has_unmodelled_ranges)
+    elide_acyclic_program_constants(prog);
+  // Narrow input windows before register compaction. Otherwise an unused
+  // vector prefix/suffix is pinned by the seed range and survives in every
+  // invocation's scratch. Offsets stay relative to the graph descriptor;
+  // emit_island adds any descriptor-packing offset later.
+  std::vector<std::pair<int, int>> input_ranges;
+  for (const auto& input : prog.ins)
+    input_ranges.emplace_back(input.reg, input.len);
+  const auto used_inputs = used_program_inputs(prog, input_ranges);
+  for (size_t k = 0; k < prog.ins.size(); ++k) {
+    auto& input = prog.ins[k];
+    input.offset += used_inputs[k].first - input.reg;
+    input.reg = used_inputs[k].first;
+    input.len = used_inputs[k].second;
+  }
+  // The straight-line compactor derives every range width from Instr::len.
+  // Structured matrix calls use that field for the result width while
+  // their operands can have different widths, so retain the original
+  // register numbering until those instructions carry explicit spans.
+  if (!has_back_edge && !has_unmodelled_ranges) compact_island(prog);
+  if (has_back_edge) {
+    sink_program_fills(prog);
+    elide_program_dead_constants(prog);
+  }
+  // Generated quantities have no backward consumer.
+  prog.native_adj = native && gen_adjoint(prog, keep_every_clear) &&
+                    !std::getenv("STANLI_NO_NATIVE_ADJ");
+}
+// Compile `s` (a statement region) or `e` (a ternary) into a program.
+void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
+                            IslandRegion* reg, Range* expr_out,
+                            std::shared_ptr<IslandProg>* prog_out) {
+  auto prog = std::make_shared<IslandProg>();
+  ProgramCompiler c{*prog, fun_defs};
+  c.in_write_array = in_write_array;
+  c.checked_region = s;
+  // Non-returning statement calls may print or reject. A register program
+  // would replay them during reverse mode, so ProgramCompiler refuses them
+  // until necessity islands have an execute-once effect path.
+  std::set<std::string> names;
+  if (s) mir::collect_names(*s, &names);
+  if (e) mir::collect_names(*e, &names);
+  configure_island_compiler(c, *prog, *reg, names, s);
+  if (!in_write_array) {
+    c.bind_target = [&](Range* r) {
+      const int slot = current_target_slot();
+      r->reg = c.alloc(1);
+      r->len = 1;
+      prog->ins.push_back(IslandProg::LiveIn{r->reg, 1});
+      reg->in_slots.push_back(slot);
+      return true;
+    };
+  }
+  std::set<std::string> outer_names, outer_int_names;
   // `target +=` inside the region accumulates into a register of its
   // own, seeded to zero, and the total leaves as one more live-out that
   // lowering registers as a target term. A `~` statement cannot go here
@@ -416,6 +579,10 @@ void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
       // has to leave it that way.
       std::vector<std::string> pre;
       assigned_names(*s, &pre);
+      for (const std::string& name : pre) {
+        if (scope.count(name) || decls.count(name)) outer_names.insert(name);
+        if (int_locals.count(name)) outer_int_names.insert(name);
+      }
       for (const std::string& name : pre) {
         if (scope.count(name) || int_locals.count(name)) continue;
         auto dl = decls.find(name);
@@ -487,52 +654,48 @@ void Lowering::lower_island(const mir::Stmt* s, const mir::Expr* e,
   if (prog->out_regs.empty() && !(e && expr_out->len == 0) &&
       (s == nullptr || reg->out_names.empty()) && !reg->has_effect)
     fail("runtime-control region produces nothing", s ? s->raw : e->raw);
-  // Forward-only branches can record the executed path for generated
-  // adjoints. Unsupported derivatives and loops retain the replay.
-  // The register compactor's liveness analysis is straight-line (with
-  // forward branches as barriers).  A while adds a back edge, so retaining
-  // the uncompact program is the correctness-first choice: a state register
-  // written in one iteration is necessarily live at the next head.
-  bool has_back_edge = false;
-  bool has_unmodelled_ranges = false;
-  for (size_t pc = 0; pc < prog->code.size(); ++pc) {
-    const Program::Instr& instr = prog->code[pc];
-    if (program_code_spec(instr.code).has(kProgramNoAdjoint))
-      has_unmodelled_ranges = true;
-    if ((instr.code == Program::JZ || instr.code == Program::JMP) &&
-        instr.dst <= static_cast<int>(pc)) {
-      has_back_edge = true;
-    }
-  }
-  if (!has_back_edge && !has_unmodelled_ranges)
-    elide_acyclic_program_constants(*prog);
-  // Narrow input windows before register compaction. Otherwise an unused
-  // vector prefix/suffix is pinned by the seed range and survives in every
-  // invocation's scratch. Offsets stay relative to the graph descriptor;
-  // emit_island adds any descriptor-packing offset later.
-  std::vector<std::pair<int, int>> input_ranges;
-  for (const auto& input : prog->ins)
-    input_ranges.emplace_back(input.reg, input.len);
-  const auto used_inputs = used_program_inputs(*prog, input_ranges);
-  for (size_t k = 0; k < prog->ins.size(); ++k) {
-    auto& input = prog->ins[k];
-    input.offset += used_inputs[k].first - input.reg;
-    input.reg = used_inputs[k].first;
-    input.len = used_inputs[k].second;
-  }
-  // The straight-line compactor derives every range width from Instr::len.
-  // Structured matrix calls use that field for the result width while
-  // their operands can have different widths, so retain the original
-  // register numbering until those instructions carry explicit spans.
-  if (!has_back_edge && !has_unmodelled_ranges) compact_island(*prog);
-  if (has_back_edge) {
-    sink_program_fills(*prog);
-    elide_program_dead_constants(*prog);
-  }
-  // Generated quantities have no backward consumer.
-  prog->native_adj = !in_write_array && gen_adjoint(*prog) &&
-                     !std::getenv("STANLI_NO_NATIVE_ADJ");
+  finalize_island_program(*prog, !in_write_array, false, true);
   *prog_out = std::move(prog);
+}
+std::vector<int> Lowering::pack_island_inputs(IslandProg& prog,
+                                              std::vector<int> inputs) {
+  if (inputs.size() <= 6) {
+    for (size_t k = 0; k < inputs.size(); ++k) {
+      prog.ins[k].input = (int)k;
+    }
+  } else {
+    // Op::in is deliberately compact. Pack just enough leading live-ins
+    // to leave five ordinary descriptors; the program's LiveIn records
+    // retain the individual register ranges and point into the packed one.
+    const size_t packed_count = inputs.size() - 5;
+    for (size_t k = 0; k < packed_count; ++k) {
+      auto& input = prog.ins[k];
+      if (input.len == 0 || input.len == g.slots[inputs[k]].len) continue;
+      inputs[k] = emit_raw(input.len == 1 ? OP_INDEX : OP_SLICE, {inputs[k]},
+                           input.len, {}, {input.offset})
+                      .slot;
+      input.offset = 0;
+    }
+    int packed = inputs[0];
+    int64_t packed_len = g.slots[packed].len;
+    for (size_t k = 1; k < packed_count; ++k) {
+      packed_len += g.slots[inputs[k]].len;
+      packed = emit_raw(OP_CONCAT2, {packed, inputs[k]}, packed_len, {}).slot;
+    }
+    int offset = 0;
+    for (size_t k = 0; k < packed_count; ++k) {
+      prog.ins[k].input = 0;
+      prog.ins[k].offset += offset;
+      offset += g.slots[inputs[k]].len;
+    }
+    std::vector<int> compact{packed};
+    for (size_t k = packed_count; k < inputs.size(); ++k) {
+      prog.ins[k].input = (int)compact.size();
+      compact.push_back(inputs[k]);
+    }
+    inputs = std::move(compact);
+  }
+  return inputs;
 }
 // The OP_ISLAND for a compiled region, plus one extraction per live-out.
 void Lowering::emit_island(const std::shared_ptr<IslandProg>& prog,
@@ -543,37 +706,7 @@ void Lowering::emit_island(const std::shared_ptr<IslandProg>& prog,
   for (int len : out_lens) packed += len;
   Op is;
   is.opcode = OP_ISLAND;
-  // Variant stays zero: kIslandSoftmax3Variant is a tagged-payload contract
-  // and may only accompany Softmax3IslandProg (the graph carver creates it).
-  std::vector<int> inputs = reg.in_slots;
-  if (inputs.size() <= 6) {
-    for (size_t k = 0; k < prog->ins.size(); ++k) {
-      prog->ins[k].input = (int)k;
-    }
-  } else {
-    // Op::in is deliberately compact. Pack just enough leading live-ins
-    // to leave five ordinary descriptors; the program's LiveIn records
-    // retain the individual register ranges and point into the packed one.
-    const size_t packed_count = inputs.size() - 5;
-    int packed = inputs[0];
-    int64_t packed_len = g.slots[packed].len;
-    for (size_t k = 1; k < packed_count; ++k) {
-      packed_len += g.slots[inputs[k]].len;
-      packed = emit_raw(OP_CONCAT2, {packed, inputs[k]}, packed_len, {}).slot;
-    }
-    int offset = 0;
-    for (size_t k = 0; k < packed_count; ++k) {
-      prog->ins[k].input = 0;
-      prog->ins[k].offset += offset;
-      offset += g.slots[reg.in_slots[k]].len;
-    }
-    std::vector<int> compact{packed};
-    for (size_t k = packed_count; k < inputs.size(); ++k) {
-      prog->ins[k].input = (int)compact.size();
-      compact.push_back(inputs[k]);
-    }
-    inputs = std::move(compact);
-  }
+  std::vector<int> inputs = pack_island_inputs(*prog, reg.in_slots);
   if (!prog->native_adj) {
     std::vector<std::pair<int, int>> input_ranges;
     for (const auto& input : prog->ins)
@@ -604,6 +737,7 @@ void Lowering::emit_island(const std::shared_ptr<IslandProg>& prog,
 }
 // `if (<not known while building the graph>) ... else ...`
 void Lowering::lower_runtime_ifelse(const mir::Stmt& s) {
+  if (structured_unroll_depth > 0) throw SpecializationRefused{};
   IslandRegion reg;
   std::shared_ptr<IslandProg> prog;
   Range ignored;
@@ -675,6 +809,7 @@ void Lowering::lower_runtime_ifelse(const mir::Stmt& s) {
 }
 // `<not known while building the graph> ? a : b`
 Lowering::Val Lowering::lower_runtime_ternary(const mir::Expr& e) {
+  if (structured_unroll_depth > 0) throw SpecializationRefused{};
   IslandRegion reg;
   std::shared_ptr<IslandProg> prog;
   Range value;
@@ -798,6 +933,30 @@ bool Lowering::repeatable_target_stmt(const mir::Stmt& s,
       // statement kinds all keep the ordinary per-iteration path.
       return false;
   }
+}
+// True when every statement assigns a scalar integer local a value that
+// needs nothing from run time, possibly under conditions that need nothing
+// either. Such statements lower to compile-time integers and no graph ops.
+bool Lowering::static_int_bookkeeping(const std::vector<mir::Stmt>& body) {
+  if (body.empty()) return false;
+  for (const mir::Stmt& s : body) {
+    switch (s.kind) {
+      case mir::Stmt::Skip:
+        break;
+      case mir::Stmt::Block:
+      case mir::Stmt::SList:
+        if (!static_int_bookkeeping(s.body)) return false;
+        break;
+      case mir::Stmt::Assignment:
+        if (!s.lhs_idx.empty() || !int_locals.count(s.lhs) ||
+            expr_effectful(s.rhs) || needs_runtime_value(s.rhs))
+          return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
 }
 // Availability is independent of both MIR's AD type and param_free. A
 // data-only loop result lives in a slot without a compile-time observation.
@@ -1014,7 +1173,7 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         // not constrain the fresh variable's width.
         scope.erase(s.decl_id);
         DeclView sh;
-        sh.len = sized_len(s.decl_type);
+        sh.len = sized_len(s.decl_type, nullptr, nullptr, s.decl_id);
         sh.autodiff = !s.decl_data_only && scalar_autodiff();
         sh.si = view_of(s.decl_type);
         // CmdStan fills every uninitialized integer container with the
@@ -1230,11 +1389,26 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         }
         Val nv = prev_v;
         if (!cells->empty()) {
+          // Each element of a known right-hand side is known too, so the
+          // written container stays known.
+          const DataMap::Entry* known = observation(rhs_v);
+          const auto known_at =
+              known ? observed_positions(rhs_v) : std::nullopt;
           for (int64_t k = 0; k < map.count; ++k) {
             const int cell =
                 checked_immediate((*cells)[(size_t)k], "assignment cell");
             const Val el =
                 emit_value(OP_INDEX, {rhs_v}, 1, view_of("UReal"), {(int)k});
+            if (known_at) {
+              const size_t from = (size_t)(*known_at)[(size_t)k];
+              DataMap::Entry one;
+              one.r = {known->r.at(from)};
+              if (known->is_int && !known->i.empty()) {
+                one.is_int = true;
+                one.i = {known->i.at(from)};
+              }
+              observe(el, std::move(one));
+            }
             const Val next = emit_value(OP_SET_INDEX, {nv, el},
                                         g.slots[prev].len, out_si, {cell});
             propagate_int_update(next, nv, el, (*cells)[(size_t)k], 1);
@@ -1281,7 +1455,9 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         return;
       if (!write_array_known_static && in_write_array &&
           needs_runtime_control(s)) {
-        auto snapshot = wa_snapshot();
+        std::set<std::string> mentioned;
+        mir::collect_names(s, &mentioned);
+        auto snapshot = wa_snapshot(mentioned);
         try {
           lower_runtime_ifelse(s);
           return;
@@ -1379,7 +1555,8 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
             s.check_transform->kind == mir::Transform::Lower   ? OP_CHECK_LOWER
             : s.check_transform->kind == mir::Transform::Upper ? OP_CHECK_UPPER
                                                                : 0;
-        if (opcode == 0) fail("unsupported FnCheck transform", s.raw);
+        if (opcode == 0)
+          fail("this constraint check is not supported yet", s.raw);
 
         const Val value = lower_expr(s.fn_args[0]);
         const Val bound = lower_expr(s.fn_args[1]);
@@ -1517,7 +1694,7 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         out.views.push_back(pv);
         return;
       }
-      fail("unsupported statement function " + s.fn_name);
+      fail("this kind of statement is not supported yet", s.raw);
     case mir::Stmt::For: {
       // Unrolled graphs and counted structured loops capture their upper
       // bound. Mutable or effectful bounds need the register loop's repeated
@@ -1549,8 +1726,6 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
           static_cast<long double>(hi) - lo + 1 >
               specialization_step_limit - specialization_steps)
         throw SpecializationRefused{};
-      if (&s == symbolic_lane_tail && try_lower_symbolic_lane_tail(s, lo, hi))
-        return;
       // Both the pre-control target fold and the ordinary path ask the same
       // structural question.  A nonselected automatic candidate reaches
       // both sites, so retain the answer for this lowering encounter rather
@@ -1560,11 +1735,7 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         if (!repeatable_target) repeatable_target = repeatable_target_body(s);
         return *repeatable_target;
       };
-      // Both cheap invariant folding and retained selection precede the
-      // per-iteration control scan. Neither needs an expanded graph.
-      if ((structured_policy == StructuredMode::Prefer ||
-           structured_policy == StructuredMode::Force) &&
-          lo != hi && has_repeatable_target()) {
+      const auto fold_repeatable_target = [&]() {
         const double old_scale = target_scale;
         target_scale *= static_cast<double>(hi) - static_cast<double>(lo) + 1;
         int_env[s.loopvar] = lo;
@@ -1577,13 +1748,34 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         }
         target_scale = old_scale;
         int_env.erase(s.loopvar);
+      };
+      // Both cheap invariant folding and retained selection precede the
+      // per-iteration control scan. Neither needs an expanded graph.
+      if ((structured_policy == StructuredMode::Prefer ||
+           structured_policy == StructuredMode::Force) &&
+          lo != hi && has_repeatable_target()) {
+        fold_repeatable_target();
         return;
       }
-      if (try_lower_region(s, std::pair<int64_t, int64_t>{lo, hi})) return;
-      if (in_write_array && structured_policy != StructuredMode::Off &&
-          region_auto_profitable(s, std::pair<int64_t, int64_t>{lo, hi})) {
-        lower_runtime_ifelse(s);
-        return;
+      // A loop that only counts into integer locals from values known now
+      // (how many observations are zero, say) is evaluated here, emitting
+      // nothing. Kept as a region its counters would exist only at run
+      // time, and a later declaration sized by one could not be laid out.
+      const bool bookkeeping = static_int_bookkeeping(s.body);
+      if (bookkeeping && std::getenv("STANLI_STRUCTURED_LOOP_DIAGNOSTICS") &&
+          region_auto_profitable(s, std::pair<int64_t, int64_t>{lo, hi}))
+        emit_diagnostic(
+            "stanli_structured counting loop evaluated at compile "
+            "time: " +
+            std::to_string(hi - lo + 1) + " iterations");
+      if (!bookkeeping) {
+        if (lower_region_map(s, lo, hi)) return;
+        if (try_lower_region(s, std::pair<int64_t, int64_t>{lo, hi})) return;
+        if (in_write_array && structured_policy != StructuredMode::Off &&
+            region_auto_profitable(s, std::pair<int64_t, int64_t>{lo, hi})) {
+          lower_runtime_ifelse(s);
+          return;
+        }
       }
       // runtime_loop_control evaluates data-only conditions while looking
       // for a parameter-selected break/continue. Scan under the same loop
@@ -1620,30 +1812,29 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         return;
       }
       if (lo != hi && has_repeatable_target()) {
-        const double old_scale = target_scale;
-        target_scale *= static_cast<double>(hi) - static_cast<double>(lo) + 1.0;
-        int_env[s.loopvar] = lo;
-        try {
-          for (const auto& child : s.body) lower_stmt(child);
-        } catch (...) {
-          target_scale = old_scale;
-          int_env.erase(s.loopvar);
-          throw;
-        }
-        target_scale = old_scale;
-        int_env.erase(s.loopvar);
+        fold_repeatable_target();
         return;
       }
-      for (int64_t v = lo; v <= hi; ++v) {
-        int_env[s.loopvar] = static_cast<long>(v);
-        try {
-          for (const auto& k : s.body) lower_stmt(k);
-        } catch (LoopContinue&) {
-          continue;
-        } catch (LoopBreak&) {
-          break;
+      const int unrolled =
+          bounded_specialization &&
+          region_auto_profitable(s, std::pair<int64_t, int64_t>{lo, hi});
+      structured_unroll_depth += unrolled;
+      try {
+        for (int64_t v = lo; v <= hi; ++v) {
+          int_env[s.loopvar] = static_cast<long>(v);
+          try {
+            for (const auto& k : s.body) lower_stmt(k);
+          } catch (LoopContinue&) {
+            continue;
+          } catch (LoopBreak&) {
+            break;
+          }
         }
+      } catch (...) {
+        structured_unroll_depth -= unrolled;
+        throw;
       }
+      structured_unroll_depth -= unrolled;
       int_env.erase(s.loopvar);
       return;
     }
@@ -1670,6 +1861,7 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
         --while_unroll_depth;
         if (complete) return;
       }
+      if (static_int_bookkeeping(s.body) && unroll_while(s)) return;
       if (try_lower_region(s)) return;
       // Unlike `for`, a `while` has no statically supplied trip count.
       // Compile it as one structured register-program island, which
@@ -1677,6 +1869,28 @@ void Lowering::lower_stmt_impl(const mir::Stmt& s) {
       // iterations under autodiff.  This deliberately has no lowering-time
       // iteration cap: nontermination is the model's runtime behaviour,
       // not a reason to silently truncate or reject a finite long loop.
+      std::set<std::string> mentioned;
+      mir::collect_names(s, &mentioned);
+      auto snapshot = wa_snapshot(mentioned);
+      try {
+        lower_runtime_ifelse(s);
+        return;
+      } catch (const CompileError&) {
+      } catch (const std::logic_error&) {
+      }
+      wa_restore(snapshot);
+      auto unrolled = wa_snapshot(mentioned);
+      ++while_unroll_depth;
+      bool complete = false;
+      try {
+        complete = unroll_while(s);
+      } catch (...) {
+        --while_unroll_depth;
+        throw;
+      }
+      --while_unroll_depth;
+      if (complete) return;
+      wa_restore(unrolled);
       lower_runtime_ifelse(s);
       return;
     }

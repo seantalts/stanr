@@ -8,6 +8,8 @@ std::map<std::string, IntRange> region_analysis_ints;
 int region_control_depth = 0;
 bool region_control_active = false;
 unsigned structured_outer_depth = 0;
+bool region_unreachable = false;
+std::set<std::string> region_unsized_unagreed;
 std::map<std::pair<const mir::Expr*, std::string>, std::optional<RealRange>>
     region_enumerated_cache;
 
@@ -380,7 +382,7 @@ std::optional<DataMap::Entry> region_bounded_data_value(const mir::Expr& e) {
   int64_t steps = 0;
   MirHooks hooks;
   hooks.data = [this](const std::string& name) -> const DataMap::Entry* {
-    return data.has(name) ? &data.at(name) : nullptr;
+    return data_entry(name);
   };
   hooks.int_var = [this](const std::string& name, long* value) {
     const auto found = int_env.find(name);
@@ -391,7 +393,7 @@ std::optional<DataMap::Entry> region_bounded_data_value(const mir::Expr& e) {
   hooks.stmt = [&](const mir::Stmt&) {
     if (++steps > 4096)
       throw CompileError(
-          "stanli compile: structured data probe budget exceeded");
+          "structured data probe budget exceeded");
     return false;
   };
   try {
@@ -465,7 +467,7 @@ std::optional<RealRange> region_enumerated_data_range(const mir::Expr& e) {
   if (!collect(e)) return {};
   const auto unresolvable = [&](const auto& self, const mir::Expr& value) -> bool {
     if (value.kind == mir::Expr::Var)
-      return !variables.count(value.name) && !data.has(value.name) &&
+      return !variables.count(value.name) && !data_entry(value.name) &&
              !int_env.count(value.name) && !td.find(value.name);
     if (value.kind == mir::Expr::EAnd || value.kind == mir::Expr::EOr ||
         value.kind == mir::Expr::TernaryIf)
@@ -493,7 +495,7 @@ std::optional<RealRange> region_enumerated_data_range(const mir::Expr& e) {
             grid != variables.end()) {
           key += "G" + value.name + ":" + std::to_string(grid->second.lo) +
                  "," + std::to_string(grid->second.hi) + ";";
-        } else if (!data.has(value.name)) {
+        } else if (!data_entry(value.name)) {
           if (const auto local = int_env.find(value.name);
               local != int_env.end()) {
             key += "N" + value.name + ":" + std::to_string(local->second) +
@@ -881,9 +883,62 @@ Val region_cell(const std::string& name) {
 void region_prepare_cells(const mir::Stmt& s) {
   std::vector<std::string> assigned;
   assigned_names(s, &assigned);
-  for (const auto& name : assigned)
+  for (const auto& name : assigned) {
+    if (deferred_unsized(name) && !region_size_deferred(name, s)) {
+      if (decls.at(name).deferred_shape)
+        fail("structured branch assigns an unsized local: " + name);
+      region_unsized_unagreed.insert(name);
+    }
     if (scope.count(name) || int_env.count(name) || decls.count(name))
       (void)region_cell(name);
+  }
+}
+// stanc's inliner declares a callee's result zero-length; branch arms that
+// assign it share one cell, sized from the static shape they agree on.
+bool deferred_unsized(const std::string& name) const {
+  if (int_env.count(name) || int_locals.count(name)) return false;
+  const auto declaration = decls.find(name);
+  if (declaration == decls.end() ||
+      !declaration->second.runtime_dims.empty() ||
+      (!declaration->second.deferred_shape &&
+       (declaration->second.si.kind == ViewKind::Flat ||
+        declaration->second.len != 0)))
+    return false;
+  const auto bound = scope.find(name);
+  return bound == scope.end() || g.slots[bound->second.slot].len == 0;
+}
+bool region_size_deferred(const std::string& name, const mir::Stmt& s) {
+  const auto declaration = decls.find(name);
+  std::optional<StaticView> shape;
+  bool agree = true, assigned = false;
+  std::function<void(const mir::Stmt&)> visit = [&](const mir::Stmt& st) {
+    if (st.kind == mir::Stmt::Assignment && st.lhs == name &&
+        st.lhs_idx.empty()) {
+      assigned = true;
+      const auto view = try_static_view(st.rhs);
+      if (view.state != StaticProbeState::Known)
+        agree = false;
+      else if (!shape)
+        shape = view.value;
+      else if (!same_view(shape->si, shape->len, view.value.si,
+                          view.value.len))
+        agree = false;
+    }
+    for (const auto& child : st.body) visit(child);
+  };
+  visit(s);
+  if (!assigned) return true;
+  if (!agree || !shape) return false;
+  if (shape->len == 0) return true;
+  Val value{add_slot(shape->len, false), false, shape->si};
+  out.fills.emplace_back(
+      value.slot, std::vector<double>((size_t)shape->len,
+                                      std::numeric_limits<double>::quiet_NaN()));
+  scope[name] = value;
+  declaration->second.len = shape->len;
+  declaration->second.si = shape->si;
+  declaration->second.deferred_shape = false;
+  return true;
 }
 // A reusable body must account for every iteration, not just the incoming
 // values. Compute a conservative fixed point over source dependencies before
@@ -1842,7 +1897,10 @@ void lower_region_stmt(const mir::Stmt& s) {
   switch (s.kind) {
     case mir::Stmt::Block:
     case mir::Stmt::SList:
-      for (const auto& c : s.body) lower_stmt(c);
+      for (const auto& c : s.body) {
+        if (region_unreachable) break;
+        lower_stmt(c);
+      }
       return;
     case mir::Stmt::For: {
       if (!invariant_for_upper(s))
@@ -2085,6 +2143,7 @@ void lower_region_stmt(const mir::Stmt& s) {
       std::map<int, IntRange> arms[2];
       std::map<int, RealRange> real_arms[2];
       std::map<std::string, Val> arm_scopes[2];
+      bool arm_exits[2] = {false, false};
       for (size_t arm = 0; arm < 2; ++arm) {
         scope = base_scope;
         region_cells = base_cells;
@@ -2098,7 +2157,9 @@ void lower_region_stmt(const mir::Stmt& s) {
         region_control_active = base_control || !condition.si.param_free;
         region_current = &branch.children[arm];
         ++region_control_depth;
+        region_unreachable = false;
         if (arm < s.body.size()) lower_stmt(s.body[arm]);
+        arm_exits[arm] = region_unreachable;
         --region_control_depth;
         region_flush();
         arms[arm] = int_ranges;
@@ -2114,6 +2175,7 @@ void lower_region_stmt(const mir::Stmt& s) {
       int_ranges = base_ranges;
       real_ranges = base_real_ranges;
       region_control_active = base_control;
+      region_unreachable = arm_exits[0] && arm_exits[1];
       std::vector<std::string> writes;
       assigned_names(s, &writes);
       for (const auto& name : writes)
@@ -2157,6 +2219,7 @@ void lower_region_stmt(const mir::Stmt& s) {
       if (s.read_transform)
         fail("parameter declaration inside structured loop");
       region_cells.erase(s.decl_id);
+      region_unsized_unagreed.erase(s.decl_id);
       // Container sizes are data-only in Stan, but a retained loop can
       // compute them at execution time. Allocate a proved maximum and
       // carry the current logical extent in a scalar graph slot. This is
@@ -2276,14 +2339,13 @@ void lower_region_stmt(const mir::Stmt& s) {
         auto base = scope.find(s.lhs);
         if (base != scope.end()) check_slot_budget(g.slots[base->second.slot].len);
       }
-      if (!scope.count(s.lhs)) {
-        const auto declaration = decls.find(s.lhs);
-        if (declaration != decls.end() && declaration->second.deferred_shape &&
-            s.lhs_idx.empty()) {
-          lower_stmt_impl(s);
-          (void)region_cell(s.lhs);
-          return;
-        }
+      if (s.lhs_idx.empty() && deferred_unsized(s.lhs) &&
+          !region_unsized_unagreed.count(s.lhs)) {
+        region_cells.erase(s.lhs);
+        scope.erase(s.lhs);
+        lower_stmt_impl(s);
+        (void)region_cell(s.lhs);
+        return;
       }
       (void)region_cell(s.lhs);
       auto range = region_range(s.rhs);
@@ -2320,6 +2382,7 @@ void lower_region_stmt(const mir::Stmt& s) {
       n.kind =
           s.kind == mir::Stmt::Break ? RegionNode::Break : RegionNode::Continue;
       region_append(std::move(n));
+      region_unreachable = true;
       return;
     }
     case mir::Stmt::Return:
@@ -2344,13 +2407,17 @@ void lower_region_stmt(const mir::Stmt& s) {
       fail("unsupported structured statement");
   }
 }
-static int64_t region_setting(const char* name, int64_t fallback) {
-  const char* raw = std::getenv(name);
-  if (!raw || !*raw) return fallback;
-  char* end = nullptr;
-  const long long value = std::strtoll(raw, &end, 10);
-  return end && *end == 0 && value >= 0 ? static_cast<int64_t>(value)
-                                        : fallback;
+static bool region_condition_data(const mir::Expr& e) {
+  if (e.data_only) return true;
+  if (e.kind != mir::Expr::FunApp && e.kind != mir::Expr::EAnd &&
+      e.kind != mir::Expr::EOr)
+    return false;
+  if (e.kind == mir::Expr::FunApp && e.fn_lib != mir::Expr::Lib::StanLib)
+    return false;
+  if (e.args.empty()) return false;
+  for (const auto& a : e.args)
+    if (!region_condition_data(a)) return false;
+  return true;
 }
 bool region_runtime_control(const mir::Stmt& root) const {
   std::set<std::string> visited;
@@ -2359,10 +2426,10 @@ bool region_runtime_control(const mir::Stmt& root) const {
       [&](const mir::Expr& e, unsigned depth) {
         if (depth > 32) return false;
         if (e.kind == mir::Expr::TernaryIf && !e.args.empty() &&
-            !e.args[0].data_only)
+            !region_condition_data(e.args[0]))
           return true;
         if ((e.kind == mir::Expr::EAnd || e.kind == mir::Expr::EOr) &&
-            !e.data_only)
+            !region_condition_data(e))
           return true;
         if (e.kind == mir::Expr::FunApp &&
             e.fn_lib == mir::Expr::Lib::UserDefined) {
@@ -2378,7 +2445,8 @@ bool region_runtime_control(const mir::Stmt& root) const {
   statement = [&](const mir::Stmt& s, unsigned depth) {
     if (depth > 32) return false;
     if (s.kind == mir::Stmt::While) return true;
-    if (s.kind == mir::Stmt::IfElse && !s.cond.data_only) return true;
+    if (s.kind == mir::Stmt::IfElse && !region_condition_data(s.cond))
+      return true;
     for (const mir::Expr* value :
          {&s.init, &s.rhs, &s.target, &s.lower, &s.upper, &s.cond})
       if (expression(*value, depth + 1)) return true;
@@ -2468,8 +2536,7 @@ bool region_unroll_profitable(const mir::Stmt& s) {
   if (count > 4) return false;
   for (const auto& c : s.body)
     if (!region_scalar_body(c)) return false;
-  const uint64_t limit = static_cast<uint64_t>(std::min<int64_t>(
-      128, region_setting("STANLI_STRUCTURED_UNROLL_LIMIT", 65536)));
+  const uint64_t limit = 128;
   return region_cost(s, limit + 1) <= limit;
 }
 uint64_t region_cost(const mir::Stmt& s, uint64_t limit, unsigned depth = 0) {
@@ -2576,7 +2643,9 @@ bool try_lower_region(
       // Keep the complete trial seed in one audited helper. The candidate owns
       // its mutable interpreter and shape state until every refusal point has
       // passed; only the shape interner is published below.
-      Lowering trial = fork_region_trial();
+      std::set<std::string> mentioned;
+      mir::collect_names(s, &mentioned);
+      Lowering trial = fork_region_trial(&mentioned);
       trial.in_write_array = in_write_array;
       trial.bounded_output = output_references != nullptr;
       auto p = std::make_shared<StructuredLoop>();
@@ -2596,22 +2665,25 @@ bool try_lower_region(
       // Runtime geometry slots can be anonymous declaration snapshots, so
       // collect them explicitly rather than assuming every imported slot
       // has its own source-level name.
-      for (const auto& item : scope) {
-        if (output_references && !output_references->count(item.first))
-          continue;
+      const auto imported_scope = [&](const auto& visit) {
+        for (const std::string& name : mentioned) {
+          if (output_references && !output_references->count(name)) continue;
+          if (const auto item = scope.find(name); item != scope.end())
+            visit(*item);
+        }
+      };
+      imported_scope([&](const auto& item) {
         import_slot(item.second.slot, item.second.autodiff,
                     item.second.si.param_free);
         for (int dim : item.second.runtime_dims) import_slot(dim, false, true);
-      }
+      });
       for (const auto& in : imported) {
         if (auto range = int_ranges.find(in.first); range != int_ranges.end())
           trial.int_ranges[in.second] = range->second;
         if (auto range = real_ranges.find(in.first); range != real_ranges.end())
           trial.real_ranges[in.second] = range->second;
       }
-      for (const auto& item : scope) {
-        if (output_references && !output_references->count(item.first))
-          continue;
+      imported_scope([&](const auto& item) {
         Val value = item.second;
         value.slot = imported.at(item.second.slot);
         for (int& dim : value.runtime_dims)
@@ -2623,7 +2695,7 @@ bool try_lower_region(
             declaration != trial.decls.end())
           for (int& dim : declaration->second.runtime_dims)
             if (dim >= 0) dim = imported.at(dim);
-      }
+      });
       std::vector<std::string> candidate_names;
       std::vector<Val> candidate_results;
       std::vector<int> candidate_inputs;

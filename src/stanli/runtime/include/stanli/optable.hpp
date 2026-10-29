@@ -14,7 +14,6 @@ namespace stanli {
 // One list, two uses: the enum and the name table are generated from it,
 // so a new op cannot be added to one and forgotten in the other.
 #define STANLI_OPCODE_LIST(X)         \
-  X(OP_EXP)                           \
   X(OP_ADD_N)                         \
   X(OP_BCAST_FMA)                     \
   X(OP_MATVEC)                        \
@@ -77,6 +76,7 @@ namespace stanli {
   X(OP_ORDERED_PROBIT_LPMF)           \
   X(OP_ORDERED_LOGISTIC_LPMF)         \
   X(OP_WIENER_LPDF)                   \
+  X(OP_WIENER_PACKED_LPDF)            \
   X(OP_LKJ_COV_LPDF)                  \
   X(OP_BINOMIAL_LOGIT_GLM_LPMF)       \
   X(OP_CATEGORICAL_LOGIT_GLM_LPMF)    \
@@ -90,6 +90,7 @@ namespace stanli {
   X(OP_ISLAND)                        \
   X(OP_LOOP)                          \
   X(OP_REDUCE_SUM)                    \
+  X(OP_REGION_MAP)                    \
   X(OP_COMPARE)                       \
   X(OP_INT_ARITH)                     \
   X(OP_REP_VEC_DYNAMIC)               \
@@ -123,6 +124,9 @@ namespace stanli {
   X(OP_TANHV)                         \
   X(OP_TRIGAMMA)                      \
   X(OP_CUMSUM)                        \
+  X(OP_SORT_ASC)                      \
+  X(OP_SORT_DESC)                     \
+  X(OP_ORDERING)                      \
   X(OP_FMA)                           \
   X(OP_ATAN2)                         \
   X(OP_BETA_FN)                       \
@@ -191,7 +195,12 @@ namespace stanli {
   X(OP_ODE_ADJOINT)                   \
   X(OP_STUDENT_T_QF)                  \
   X(OP_POISSON_BINOMIAL)              \
-  X(OP_HYPERGEOMETRIC_1F0)
+  X(OP_HYPERGEOMETRIC_1F0)            \
+  X(OP_NORMAL_GROUPED_LPDF)           \
+  X(OP_LINEAR_GAUSSIAN_LPDF)          \
+  X(OP_FAMILY_GROUPED_LPDF)           \
+  X(OP_SEGMENT_SUM)                   \
+  X(OP_TO_INT)
 
 // Scalar densities, one line each: this list generates the opcode, the
 // name, the kernel, its registration, and the lowering table entry
@@ -732,7 +741,7 @@ inline void div_partials(double u, double b, double out, double* da,
 // cost of an lp__ that differs from CmdStan's by a per-model constant on
 // every `~` statement. Gradients are untouched to the bit; the chain a
 // seed produces is not, because a shifted lp rounds differently inside
-// the Hamiltonian (docs/lite-lp.md)
+// the Hamiltonian (docs/lp-constant.md)
 // -- which is why the browser build takes this and the wheel does not.
 constexpr int density_tier(int listed) {
 #ifdef STANLI_LITE_LP
@@ -815,14 +824,6 @@ constexpr BackwardPrimalReads backward_reads_inputs_only(uint8_t variant) {
   return BackwardPrimalReads{BackwardPrimalReads::kAllInputs, 0};
 }
 
-// OP_NONE_ is the graph's unregistered sentinel. A specialized Program::CALL
-// temporarily claims that otherwise-unused table slot for its fixed-size,
-// allocation-free three-lane softmax; ordinary graph ops never carry either
-// private value. Registration happens only after the specialization is
-// admitted, and refuses the optimization if the sentinel ever gains a kernel.
-constexpr uint16_t kProgramSoftmax3Opcode = OP_NONE_;
-constexpr uint8_t kProgramSoftmax3Variant = 0xffu;
-
 // Opt-in facts shared by graph rewrites. An unknown/new opcode has none.
 namespace op_trait {
 constexpr uint8_t kRerollDensity = 1 << 0;
@@ -832,6 +833,9 @@ constexpr uint8_t kRerollWidenable = 1 << 2;
 // Backward reads adjoints/scratch only, never input or output value buffers.
 constexpr uint8_t kBackwardValueFree = 1 << 3;
 constexpr uint8_t kVariantGrouped = 1 << 4;
+// Immutable payload with no slot ids; the op may be treated as reading all of
+// each input.
+constexpr uint8_t kWholeInputPayload = 1 << 5;
 }  // namespace op_trait
 
 constexpr uint8_t op_traits(uint16_t opcode) {
@@ -871,8 +875,10 @@ constexpr uint8_t op_traits(uint16_t opcode) {
     case OP_LSE2:
       return op_trait::kRerollWidenable | op_trait::kBackwardValueFree;
 
-    // Shape-dispatched elementwise ops that can widen scalar lanes in place.
     case OP_ADD:
+      return op_trait::kRerollWidenable | op_trait::kBackwardValueFree;
+
+    // Shape-dispatched elementwise ops that can widen scalar lanes in place.
     case OP_SUB:
     case OP_MUL:
     case OP_DIV:
@@ -911,11 +917,18 @@ constexpr uint8_t op_traits(uint16_t opcode) {
     case OP_LOG_SUM_EXP:
     case OP_LOG_SUM_EXP_ROWS:
     case OP_SUM_ROWS:
+    case OP_SEGMENT_SUM:
       return op_trait::kBackwardValueFree;
 
     case OP_PROD_VEC:
     case OP_EXTREMA_VEC:
       return op_trait::kVariantGrouped;
+
+    case OP_CHECK_LOWER:
+    case OP_CHECK_UPPER:
+    case OP_CHECK_MATCHING_DIMS:
+    case OP_REGION_MAP:
+      return op_trait::kWholeInputPayload;
     default:
       return 0;
   }
@@ -943,6 +956,7 @@ constexpr bool is_effectful_op(uint16_t opcode) {
     case OP_REJECT:
     case OP_LOOP:
     case OP_REDUCE_SUM:
+    case OP_REGION_MAP:
       return true;
     default:
       return false;
@@ -987,7 +1001,13 @@ struct Kernel {
   // Diagnostic description owned by this implementation, not the opcode.
   // Unclassified is intentional: missing metadata never proves tape freedom.
   const char* derivative_mechanism = "unclassified";
+  CachedMicroFn cached_micro = nullptr;
 };
+
+inline Kernel with_cached_micro(Kernel k, CachedMicroFn micro) {
+  k.cached_micro = micro;
+  return k;
+}
 
 inline BackwardPrimalReads backward_primal_reads(const Kernel* kernel,
                                                  uint8_t variant) {

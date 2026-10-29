@@ -60,6 +60,7 @@ enum class BuiltinShapePolicy : uint8_t {
   // graph opcode; the shared resolver validates the square divisor and
   // conformable dividend and reports the result shape.
   Solve,
+  Ordering,
 };
 
 // Which factorization a Solve descriptor's kernel applies to the divisor.
@@ -95,6 +96,15 @@ enum class BuiltinShapeQueryKind : uint8_t {
   Size,
   NumElements,
   Dims,
+};
+
+enum class BuiltinOrdering : uint8_t {
+  None,
+  SortAsc,
+  SortDesc,
+  IndicesAsc,
+  IndicesDesc,
+  Rank,
 };
 
 // Which matrix kernel a MatrixOp descriptor drives. The kernels themselves
@@ -135,6 +145,7 @@ enum class BuiltinSlice : uint8_t {
   ToRowVector,
   ToMatrix,
   ToArray1d,
+  ToArray2d,
   ToVectorArray,
   ToRowVectorArray,
   // Expansions: broadcasts of one value or container, and two-container
@@ -225,6 +236,7 @@ struct BuiltinSpec {
   // the opcode field carries the solve kernel.
   bool solve_left = false;
   BuiltinSolveKind solve = BuiltinSolveKind::None;
+  BuiltinOrdering ordering = BuiltinOrdering::None;
 };
 
 inline bool builtin_argument_is_integer(const BuiltinSpec& spec, size_t i) {
@@ -263,6 +275,13 @@ struct ConstructorValue {
 ConstructorValue evaluate_constructor_builtin(
     const BuiltinSpec& spec, const std::vector<double>& arguments);
 
+std::vector<int> evaluate_ordering_builtin(const BuiltinSpec& spec,
+                                           const std::vector<double>& values,
+                                           int position = 0);
+std::vector<int> evaluate_ordering(BuiltinOrdering kind,
+                                   const std::vector<double>& values,
+                                   int position = 0);
+
 // One SliceView selection resolved to flat source cells: every output cell k
 // reads exactly one input cell -- offset + k (Contiguous), offset + k*stride
 // (Strided), or gather[k] (Gather) -- in the caller's declared storage order.
@@ -289,6 +308,7 @@ inline bool builtin_slice_is_reshape(BuiltinSlice slice) {
   return slice == BuiltinSlice::Transpose || slice == BuiltinSlice::ToVector ||
          slice == BuiltinSlice::ToRowVector ||
          slice == BuiltinSlice::ToMatrix || slice == BuiltinSlice::ToArray1d ||
+         slice == BuiltinSlice::ToArray2d ||
          slice == BuiltinSlice::ToVectorArray ||
          slice == BuiltinSlice::ToRowVectorArray;
 }
@@ -468,6 +488,8 @@ int evaluate_integer_binary_builtin(const BuiltinSpec& spec, int lhs, int rhs);
 // generated integer kernels); the descriptor form above delegates here.
 int evaluate_integer_binary_builtin(uint16_t opcode, int lhs, int rhs);
 int evaluate_integer_unary_builtin(const BuiltinSpec& spec, int value);
+// to_int on a real: Stan Math's truncation and range check.
+int evaluate_real_to_integer_builtin(const BuiltinSpec& spec, double value);
 
 }  // namespace stanli
 

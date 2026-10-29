@@ -1,18 +1,25 @@
 #include <stanli/function_registry.hpp>
 #include <stanli/mir.hpp>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/container/new_allocator.hpp>
+
 #include <stdexcept>
-#include <unordered_map>
+#include <boost/unordered/unordered_flat_map.hpp>
 
 namespace stanli {
 namespace {
 
+using Overloads = boost::container::small_vector<
+    const FunctionSpec*, 1,
+    boost::container::new_allocator<const FunctionSpec*>>;
+
 struct FunctionRegistryIndex {
-  std::unordered_map<std::string_view, std::vector<const FunctionSpec*>>
-      by_name;
+  boost::unordered_flat_map<std::string_view, Overloads> by_name;
   std::array<std::vector<const FunctionSpec*>, 2> by_family;
 
   FunctionRegistryIndex() {
+    by_name.reserve(function_specs().size());
     for (const FunctionSpec& spec : function_specs()) {
       by_name[spec.name].push_back(&spec);
       by_family[spec.family() == FunctionFamily::Builtin ? 0 : 1].push_back(
@@ -26,8 +33,8 @@ const FunctionRegistryIndex& function_registry_index() {
   return index;
 }
 
-const std::vector<const FunctionSpec*>& overloads(std::string_view name) {
-  static const std::vector<const FunctionSpec*> none;
+const Overloads& overloads(std::string_view name) {
+  static const Overloads none;
   const auto& by_name = function_registry_index().by_name;
   const auto found = by_name.find(name);
   return found == by_name.end() ? none : found->second;
@@ -264,6 +271,36 @@ constexpr BuiltinSpec unary_builtin(uint16_t opcode) {
           0x1};
 }
 
+constexpr BuiltinSpec sort_builtin(
+    uint16_t opcode, BuiltinOrdering kind,
+    FunctionArgumentKind element = FunctionArgumentKind::Real) {
+  BuiltinSpec spec{
+      static_cast<uint16_t>(
+          element == FunctionArgumentKind::Real ? opcode : OP_ORDERING),
+      1,
+      {element},
+      element,
+      BuiltinShapePolicy::WholeValue,
+      BuiltinCompatibilityPolicy::LogicalShape,
+      static_cast<uint8_t>(element == FunctionArgumentKind::Real ? 0x1 : 0)};
+  spec.ordering = kind;
+  return spec;
+}
+
+constexpr BuiltinSpec ordering_builtin(
+    BuiltinOrdering kind, uint8_t arity,
+    FunctionArgumentKind element = FunctionArgumentKind::Real) {
+  BuiltinSpec spec{OP_ORDERING,
+                   arity,
+                   {element, BuiltinArgumentKind::Integer},
+                   FunctionArgumentKind::Integer,
+                   BuiltinShapePolicy::Ordering,
+                   BuiltinCompatibilityPolicy::LogicalShape,
+                   0};
+  spec.ordering = kind;
+  return spec;
+}
+
 DensitySpec all_integer_spec(int arity, AllIntegerDensity density) {
   DensitySpec spec{OP_ALL_INTEGER_DENSITY, arity, arity};
   spec.fixed_variant = static_cast<uint8_t>(density);
@@ -348,7 +385,7 @@ bool FunctionSpec::accepts(size_t call_arity,
 const std::vector<FunctionSpec>& function_specs() {
   static const std::vector<FunctionSpec> entries = [] {
     std::vector<FunctionSpec> result;
-    result.reserve(384);
+    result.reserve(512);
     const auto builtin = [&](std::string_view name, BuiltinSpec spec) {
       result.emplace_back(name, std::move(spec));
     };
@@ -408,6 +445,14 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("PMinus__", integer_unary_builtin(OP_NEG));
     builtin("minus", integer_unary_builtin(OP_NEG));
     builtin("abs", integer_unary_builtin(OP_ABS));
+    builtin("to_int", integer_unary_builtin(OP_TO_INT));
+    builtin("to_int", {OP_TO_INT,
+                       1,
+                       {BuiltinArgumentKind::Real},
+                       FunctionArgumentKind::Integer,
+                       BuiltinShapePolicy::Elementwise,
+                       BuiltinCompatibilityPolicy::LogicalShape,
+                       0});
     builtin("fabs", unary_builtin(OP_ABS));
     builtin("std_normal_qf", unary_builtin(OP_INV_PHI));
     builtin("trigamma", unary_builtin(OP_TRIGAMMA));
@@ -431,6 +476,24 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("tanh", unary_builtin(OP_TANHV));
     builtin("cumulative_sum", unary_builtin(OP_CUMSUM));
     builtin("log_softmax", unary_builtin(OP_LOG_SOFTMAX));
+    builtin("sort_asc", sort_builtin(OP_SORT_ASC, BuiltinOrdering::SortAsc));
+    builtin("sort_asc", sort_builtin(OP_SORT_ASC, BuiltinOrdering::SortAsc,
+                                     BuiltinArgumentKind::Integer));
+    builtin("sort_desc", sort_builtin(OP_SORT_DESC, BuiltinOrdering::SortDesc));
+    builtin("sort_desc", sort_builtin(OP_SORT_DESC, BuiltinOrdering::SortDesc,
+                                      BuiltinArgumentKind::Integer));
+    builtin("sort_indices_asc",
+            ordering_builtin(BuiltinOrdering::IndicesAsc, 1));
+    builtin("sort_indices_asc", ordering_builtin(BuiltinOrdering::IndicesAsc, 1,
+                                                 BuiltinArgumentKind::Integer));
+    builtin("sort_indices_desc",
+            ordering_builtin(BuiltinOrdering::IndicesDesc, 1));
+    builtin("sort_indices_desc",
+            ordering_builtin(BuiltinOrdering::IndicesDesc, 1,
+                             BuiltinArgumentKind::Integer));
+    builtin("rank", ordering_builtin(BuiltinOrdering::Rank, 2));
+    builtin("rank", ordering_builtin(BuiltinOrdering::Rank, 2,
+                                     BuiltinArgumentKind::Integer));
     // Whole-container-to-scalar reductions. sum's integer-container overload
     // and prod/min/max's provenance-aware phased lowerings stay outside the
     // registry deliberately.
@@ -648,6 +711,7 @@ const std::vector<FunctionSpec>& function_specs() {
     builtin("to_matrix", slice_builtin(BuiltinSlice::ToMatrix, 4));
     builtin("to_array_1d", slice_builtin(BuiltinSlice::ToArray1d, 1));
     builtin("to_array_1d", slice_builtin(BuiltinSlice::ToArray1d, 1, kInt));
+    builtin("to_array_2d", slice_builtin(BuiltinSlice::ToArray2d, 1));
     // Expansions: broadcasts and concatenations. The graph keeps its
     // specialized lowerings (dynamic rep extents, the dedicated broadcast
     // kernels, append_array's data-value observations); the interpreter and
@@ -786,8 +850,7 @@ const std::vector<FunctionSpec>& function_specs() {
                                     DensityShape::VectorizedVectors, 0x3, false,
                                     0, 0, DensityEvaluationPolicy::GraphKernel,
                                     AllIntegerDensity::None, 0x2});
-    density("wiener_lpdf",
-            {OP_WIENER_LPDF, 5, 0, false, DensityShape::Plain, 0x1f});
+    density("wiener_lpdf", {OP_WIENER_LPDF, 5, 0, false, DensityShape::Plain});
     density("wishart_lpdf",
             {OP_WISHART_LPDF, 3, 0, false, DensityShape::FirstMatrixRows, 0x7});
     density("inv_wishart_lpdf", {OP_INV_WISHART_LPDF, 3, 0, false,

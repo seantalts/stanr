@@ -72,6 +72,7 @@ struct Pos {
 struct CandidatePlan {
   int64_t lanes = 0;
   bool column_major = false;
+  bool price_distinct_ops = false;
   std::vector<Pos> positions;
 };
 
@@ -80,7 +81,6 @@ struct CandidatePlan {
 // the entire scan. Target replacement preserves the original first-leaf
 // position, including surrounding terms and lazy region-to-region renaming.
 struct GraphSource {
-  static constexpr bool kDistinctLaneHashes = false;
   const Op* ops;
   int period;
   const Op& at(int p, int64_t lane) const {
@@ -110,19 +110,46 @@ struct GraphSource {
   }
 };
 
+inline std::vector<int64_t> distinct_per_position(const CandidatePlan& plan,
+                                                  const GraphSource& source) {
+  const auto& pos = plan.positions;
+  const int P = static_cast<int>(pos.size());
+  std::vector<std::unordered_set<uint64_t>> seen((size_t)P);
+  std::vector<uint64_t> value((size_t)P);
+  for (int64_t l = 0; l < plan.lanes; ++l)
+    for (int p = 0; p < P; ++p) {
+      const Op& o = source.at(p, l);
+      const Pos& ap = pos[(size_t)p];
+      uint64_t h = 1469598103934665603ull;
+      const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+      for (int j = 0; j < o.n_in; ++j) {
+        const PosIn& in = ap.ins[(size_t)j];
+        mix(in.kind == InKind::kLaneLocal ? value[(size_t)in.producer_pos]
+                                          : (uint64_t)(int64_t)o.in[j]);
+      }
+      for (int64_t m = 0; m < o.n_idata; ++m) mix((uint64_t)o.idata[m]);
+      value[(size_t)p] = h;
+      seen[(size_t)p].insert(h);
+    }
+  std::vector<int64_t> counts((size_t)P);
+  for (int p = 0; p < P; ++p)
+    counts[(size_t)p] = (int64_t)seen[(size_t)p].size();
+  return counts;
+}
+
 // Existing cost model, including CSE's distinct-input-lane discount. Geometry
 // alone must not select a vector plan: choosing this form changes reductions
-// and broadcast-adjoint accumulation order. Source::at must describe every
-// lane; a few observed iterations are not an affine/control proof.
-template <class Source>
-bool profitable(const Graph& g, const CandidatePlan& plan,
-                const Source& source) {
+// and broadcast-adjoint accumulation order.
+inline bool profitable(const Graph& g, const CandidatePlan& plan,
+                       const GraphSource& source) {
   const auto& pos = plan.positions;
   const int P = static_cast<int>(pos.size());
   const int64_t Luse = plan.lanes;
   const bool layout_cols = plan.column_major;
   int64_t ops_out = 0, added = 0, lane_elems = 0;
+  std::vector<int64_t> position_elems((size_t)P, 0);
   for (int p = 0; p < P; ++p) {
+    const int64_t elems_before = lane_elems;
     const Pos& ap = pos[(size_t)p];
     const int64_t tile_width = ap.rows > 1 ? ap.rows : ap.width;
     for (const PosIn& in : ap.ins)
@@ -173,44 +200,45 @@ bool profitable(const Graph& g, const CandidatePlan& plan,
       ++ops_out;
       lane_elems += 2 * ap.width;
     }
+    position_elems[(size_t)p] = lane_elems - elems_before;
   }
-  // A source may prove these exact hashes distinct without constructing
-  // them. This is stronger than distinct data values or distinct input tuples:
-  // multiple varying fields can collide. Arbitrary graph sources still hash.
-  // Retain the graph path's original container lifetime through the return;
-  // the proved specialization leaves it empty and the compiler removes it.
   std::unordered_set<uint64_t> lane_hash;
-  int64_t distinct = Luse;
-  if constexpr (!Source::kDistinctLaneHashes) {
-    for (int64_t l = 0; l < Luse; ++l) {
-      uint64_t h = 1469598103934665603ull;
-      const auto mix = [&h](int64_t v) {
-        h = (h ^ (uint64_t)v) * 1099511628211ull;
-      };
-      for (int p = 0; p < P; ++p) {
-        const Op& o = source.at(p, l);
-        const Pos& ap = pos[(size_t)p];
-        for (int j = 0; j < o.n_in; ++j)
-          mix(ap.ins[(size_t)j].kind == InKind::kLaneLocal ? -1 : o.in[j]);
-        for (int64_t m = 0; m < o.n_idata; ++m) mix(o.idata[m]);
-      }
-      lane_hash.insert(h);
+  for (int64_t l = 0; l < Luse; ++l) {
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](int64_t v) {
+      h = (h ^ (uint64_t)v) * 1099511628211ull;
+    };
+    for (int p = 0; p < P; ++p) {
+      const Op& o = source.at(p, l);
+      const Pos& ap = pos[(size_t)p];
+      for (int j = 0; j < o.n_in; ++j)
+        mix(ap.ins[(size_t)j].kind == InKind::kLaneLocal ? -1 : o.in[j]);
+      for (int64_t m = 0; m < o.n_idata; ++m) mix(o.idata[m]);
     }
-    distinct = (int64_t)lane_hash.size();
+    lane_hash.insert(h);
   }
-  added += ops_out * kLaneOpCost + (Luse - distinct) * lane_elems;
-  return distinct * (int64_t)P * kLaneOpCost > added + kLanePartitionMargin;
+  const int64_t distinct = (int64_t)lane_hash.size();
+  int64_t scalar_ops = distinct * (int64_t)P;
+  int64_t wasted_elems = (Luse - distinct) * lane_elems;
+  if (plan.price_distinct_ops) {
+    scalar_ops = 0;
+    wasted_elems = 0;
+    const std::vector<int64_t> counts = distinct_per_position(plan, source);
+    for (int p = 0; p < P; ++p) {
+      scalar_ops += counts[(size_t)p];
+      wasted_elems += (Luse - counts[(size_t)p]) * position_elems[(size_t)p];
+    }
+  }
+  added += ops_out * kLaneOpCost + wasted_elems;
+  return scalar_ops * kLaneOpCost > added + kLanePartitionMargin;
 }
 
 // The classifier supplies the structural proof. This move-only boundary
 // additionally enforces the unchanged cost gate and binds the source used
 // for pricing to the source used for emission. A rejection leaves candidate
 // storage intact for the driver's prefix retry; acceptance transfers it once.
-// Source must have immutable value semantics (or be a stable borrowed view):
-// copying it must preserve all lane identities and target-publication facts.
 // Call emit once; its rvalue qualification expresses the consumption contract,
 // but does not by itself prevent a caller from reusing a moved-from object.
-template <class Source>
 class SelectedPlan {
  public:
   SelectedPlan(const SelectedPlan&) = delete;
@@ -220,7 +248,7 @@ class SelectedPlan {
 
   static std::optional<SelectedPlan> select(const Graph& g,
                                             CandidatePlan& candidate,
-                                            const Source& source) {
+                                            const GraphSource& source) {
     if (!profitable(g, candidate, source)) return std::nullopt;
     return SelectedPlan(std::move(candidate), source);
   }
@@ -234,10 +262,10 @@ class SelectedPlan {
             std::unordered_map<int, int>& renamed) &&;
 
  private:
-  SelectedPlan(CandidatePlan&& plan, const Source& source)
+  SelectedPlan(CandidatePlan&& plan, const GraphSource& source)
       : plan_(std::move(plan)), source_(source) {}
   CandidatePlan plan_;
-  Source source_;
+  GraphSource source_;
 };
 
 inline int resolve_slot(const std::unordered_map<int, int>& renamed, int slot) {
@@ -245,14 +273,13 @@ inline int resolve_slot(const std::unordered_map<int, int>& renamed, int slot) {
   return it == renamed.end() ? slot : it->second;
 }
 
-template <class Source>
-void SelectedPlan<Source>::emit(Graph& g, Fills& fills,
-                                std::vector<int>& target_terms,
-                                std::unordered_set<int>& term_set,
-                                std::vector<Op>& result,
-                                std::unordered_map<int, int>& renamed) && {
+inline void SelectedPlan::emit(Graph& g, Fills& fills,
+                               std::vector<int>& target_terms,
+                               std::unordered_set<int>& term_set,
+                               std::vector<Op>& result,
+                               std::unordered_map<int, int>& renamed) && {
   CandidatePlan& plan = plan_;
-  const Source& source = source_;
+  const GraphSource& source = source_;
   const auto resolve = [&](int slot) { return resolve_slot(renamed, slot); };
   auto& pos = plan.positions;
   const int P = static_cast<int>(pos.size());

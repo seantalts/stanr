@@ -2,6 +2,7 @@
 // stan-math REV overloads' forward Eigen expressions and their backward
 // accumulation shapes (see constrain.cpp for why: packet math vs libm).
 // Shape dispatch is runtime: len==1 broadcasts.
+#include <stanli/builtin_registry.hpp>
 #include <stanli/graph.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/packet.hpp>
@@ -439,6 +440,47 @@ void cumsum_bwd(KernelCtx& ctx) {
   ctx.in_adj[0].data[0] += radj[0];
 }
 
+template <bool Ascending>
+void sort_fwd(KernelCtx& ctx) {
+  const int64_t n = ctx.in[0].len;
+  const double* x = ctx.in[0].data;
+  stan::math::check_not_nan(
+      "sort_asc", "container argument",
+      Eigen::Map<const Eigen::Matrix<double, -1, 1>>(x, n));
+  double* order = ctx.scratch;
+  for (int64_t k = 0; k < n; ++k) order[k] = static_cast<double>(k);
+  std::sort(order, order + n, [x](double i, double j) {
+    const double a = x[static_cast<int64_t>(i)];
+    const double b = x[static_cast<int64_t>(j)];
+    return Ascending ? a < b : a > b;
+  });
+  for (int64_t k = 0; k < n; ++k)
+    ctx.out.data[k] = x[static_cast<int64_t>(order[k])];
+}
+void sort_bwd(KernelCtx& ctx) {
+  if (!ctx.in_adj[0].data) return;
+  const int64_t n = ctx.out.len;
+  const double* order = ctx.scratch;
+  const double* radj = n == 1 ? &ctx.out_adj : ctx.out_adj_vec.data;
+  for (int64_t k = 0; k < n; ++k)
+    ctx.in_adj[0].data[static_cast<int64_t>(order[k])] += radj[k];
+}
+int64_t sort_scratch(const Op& op, const Slot* slots) {
+  return slots[op.in[0]].len;
+}
+
+void ordering_fwd(KernelCtx& ctx) {
+  const double* x = ctx.in[0].data;
+  const std::vector<double> values(x, x + ctx.in[0].len);
+  const int position =
+      ctx.n_in > 1 ? static_cast<int>(std::llround(ctx.in[1].data[0])) : 0;
+  const std::vector<int> result = evaluate_ordering(
+      static_cast<BuiltinOrdering>(ctx.variant), values, position);
+  for (size_t k = 0; k < result.size(); ++k)
+    ctx.out.data[k] = static_cast<double>(result[k]);
+}
+void ordering_bwd(KernelCtx&) {}
+
 // Eigen's packet log, a ulp off libm on some arguments. The matching packet
 // exp is NOT taken: it puts kronecker_gp over its reference gate.
 void logv_fwd(KernelCtx& ctx) { out_a(ctx) = in_a(ctx, 0).log(); }
@@ -503,7 +545,7 @@ void sqrtv_bwd(KernelCtx& ctx) {
     if (ctx.out.data[0] != 0.0)
       ctx.in_adj[0].data[0] += ctx.out_adj / (2.0 * ctx.out.data[0]);
   } else {
-    dx_a(ctx, 0) += (out_v != 0.0).select(dout_a(ctx) / (2.0 * out_v), 0.0);
+    dx_a(ctx, 0) += (out_v != 0.0).select(dout_a(ctx) / (2.0 * out_v), -0.0);
   }
 }
 void squarev_fwd(KernelCtx& ctx) { out_a(ctx) = in_a(ctx, 0).square(); }
@@ -629,6 +671,78 @@ void repv_dynamic_bwd(KernelCtx& ctx) {
     ctx.in_adj[0].data[0] += ctx.out_adj_vec.data[i];
 }
 
+bool add_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.variant != 0 || ctx.out.len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data && ctx.in[k].len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data)
+      out.push_back(
+          bwd_micro(kMicroAdd, ctx.in_adj[k].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool sub_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  for (int k = 0; k < 2; ++k)
+    if (ctx.in_adj[k].data && ctx.in[k].len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(
+        bwd_micro(kMicroAdd, ctx.in_adj[0].data, ctx.out_adj_vec.data));
+  if (ctx.in_adj[1].data)
+    out.push_back(
+        bwd_micro(kMicroSub, ctx.in_adj[1].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool neg_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(
+        bwd_micro(kMicroSub, ctx.in_adj[0].data, ctx.out_adj_vec.data));
+  return true;
+}
+
+bool mul_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1 || ctx.in[0].len != 1 || ctx.in[1].len != 1)
+    return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(bwd_micro(kMicroScaled, ctx.in_adj[0].data,
+                            ctx.out_adj_vec.data, ctx.in[1].data));
+  if (ctx.in_adj[1].data)
+    out.push_back(bwd_micro(kMicroScaled, ctx.in_adj[1].data,
+                            ctx.out_adj_vec.data, ctx.in[0].data));
+  return true;
+}
+
+double logv_delta(double seed, double x, double) { return seed / x; }
+double invlogit_delta(double seed, double, double y) {
+  return seed * y * (1.0 - y);
+}
+double square_delta(double seed, double x, double) { return seed * 2.0 * x; }
+double log1m_delta(double seed, double x, double) { return seed / (x - 1.0); }
+
+template <double (*Delta)(double, double, double)>
+bool unary_fn_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (ctx.in_adj[0].data)
+    out.push_back(bwd_micro(kMicroFn, ctx.in_adj[0].data, ctx.out_adj_vec.data,
+                            ctx.in[0].data, ctx.out.data, Delta));
+  return true;
+}
+
+template <double (*Delta)(double, double, double), UnaryTopology Topology>
+bool unary_list_micro(const KernelCtx& ctx, std::vector<BwdMicro>& out) {
+  if (ctx.out.len != 1) return false;
+  if (Topology == UnaryTopology::Disconnected || !ctx.in_adj[0].data)
+    return true;
+  out.push_back(
+      bwd_micro(Topology == UnaryTopology::Nonzero ? kMicroFnNonzero : kMicroFn,
+                ctx.in_adj[0].data, ctx.out_adj_vec.data, ctx.in[0].data,
+                ctx.out.data, Delta));
+  return true;
+}
+
 // Generated from STANLI_SCALAR_UNARY_LIST (optable.hpp): the value in the
 // forward, the ordered delta and its pullback topology in the backward.
 // Shape-preserving and elementwise, so a re-rolled vector arrives here as one
@@ -640,6 +754,11 @@ void repv_dynamic_bwd(KernelCtx& ctx) {
       const double x = ctx.in[0].data[i];                                    \
       ctx.out.data[i] = (VAL);                                               \
     }                                                                        \
+  }                                                                          \
+  double name##_udelta(double seed, double x, double y) {                    \
+    (void)x;                                                                 \
+    (void)y;                                                                 \
+    return (DELTA);                                                          \
   }                                                                          \
   void name##_ubwd(KernelCtx& ctx) {                                         \
     if (!ctx.in_adj[0].data) return;                                         \
@@ -658,28 +777,47 @@ STANLI_SCALAR_UNARY_LIST(STANLI_DEFINE_UNARY)
 }  // namespace
 
 void register_eltwise_kernels() {
-#define STANLI_REGISTER_UNARY(code, name, value, delta, topology) \
-  register_kernel(code, Kernel{name##_ufwd, name##_ubwd, nullptr});
+#define STANLI_REGISTER_UNARY(code, name, value, delta, topology)        \
+  register_kernel(                                                       \
+      code, with_cached_micro(Kernel{name##_ufwd, name##_ubwd, nullptr}, \
+                              unary_list_micro<name##_udelta, topology>));
   STANLI_SCALAR_UNARY_LIST(STANLI_REGISTER_UNARY)
 #undef STANLI_REGISTER_UNARY
+  register_kernel(OP_ADD,
+                  with_cached_micro(Kernel{add_fwd, add_bwd, nullptr, nullptr,
+                                           backward_reads_none},
+                                    add_micro));
   register_kernel(
-      OP_ADD, Kernel{add_fwd, add_bwd, nullptr, nullptr, backward_reads_none});
-  register_kernel(OP_SUB, Kernel{sub_fwd, sub_bwd, nullptr});
-  register_kernel(OP_MUL, Kernel{mul_fwd, mul_bwd, nullptr});
+      OP_SUB, with_cached_micro(Kernel{sub_fwd, sub_bwd, nullptr}, sub_micro));
+  register_kernel(
+      OP_MUL, with_cached_micro(Kernel{mul_fwd, mul_bwd, nullptr}, mul_micro));
   register_kernel(OP_FMA, Kernel{fma_fwd, fma_bwd, nullptr});
   register_kernel(OP_DIV, Kernel{div_fwd, div_bwd, nullptr});
   register_kernel(OP_POW, Kernel{pow_fwd, pow_bwd, nullptr});
   register_kernel(OP_DOT, Kernel{dot_fwd, dot_bwd, nullptr});
   register_kernel(OP_GROUP_DOT, Kernel{group_dot_fwd, group_dot_bwd, nullptr});
-  register_kernel(OP_NEG, Kernel{negu_fwd, negu_bwd, nullptr});
+  register_kernel(OP_NEG, with_cached_micro(Kernel{negu_fwd, negu_bwd, nullptr},
+                                            neg_micro));
   register_kernel(OP_EXPV, Kernel{expv_fwd, expv_bwd, nullptr});
   register_kernel(OP_TANHV, Kernel{tanhv_fwd, tanhv_bwd, nullptr});
   register_kernel(OP_CUMSUM, Kernel{cumsum_fwd, cumsum_bwd, nullptr});
-  register_kernel(OP_LOGV, Kernel{logv_fwd, logv_bwd, nullptr});
-  register_kernel(OP_INV_LOGIT, Kernel{invlogit_fwd, invlogit_bwd, nullptr});
+  register_kernel(OP_SORT_ASC, Kernel{sort_fwd<true>, sort_bwd, sort_scratch});
+  register_kernel(OP_SORT_DESC,
+                  Kernel{sort_fwd<false>, sort_bwd, sort_scratch});
+  register_kernel(OP_ORDERING, Kernel{ordering_fwd, ordering_bwd, nullptr});
+  register_kernel(OP_LOGV,
+                  with_cached_micro(Kernel{logv_fwd, logv_bwd, nullptr},
+                                    unary_fn_micro<logv_delta>));
+  register_kernel(OP_INV_LOGIT,
+                  with_cached_micro(Kernel{invlogit_fwd, invlogit_bwd, nullptr},
+                                    unary_fn_micro<invlogit_delta>));
   register_kernel(OP_SQRT, Kernel{sqrtv_fwd, sqrtv_bwd, nullptr});
-  register_kernel(OP_SQUARE, Kernel{squarev_fwd, squarev_bwd, nullptr});
-  register_kernel(OP_LOG1M, Kernel{log1mv_fwd, log1mv_bwd, nullptr});
+  register_kernel(OP_SQUARE,
+                  with_cached_micro(Kernel{squarev_fwd, squarev_bwd, nullptr},
+                                    unary_fn_micro<square_delta>));
+  register_kernel(OP_LOG1M,
+                  with_cached_micro(Kernel{log1mv_fwd, log1mv_bwd, nullptr},
+                                    unary_fn_micro<log1m_delta>));
   register_kernel(OP_LOGIT, Kernel{logitv_fwd, logitv_bwd, nullptr});
   register_kernel(OP_MEAN, Kernel{mean_fwd, mean_bwd, nullptr});
   register_kernel(

@@ -86,8 +86,6 @@ template <bool ReuseCallCtx>
 void island_fwd_impl(KernelCtx& ctx) {
   const auto& p = *static_cast<const IslandProg*>(ctx.udata);
   if (p.native_adj) {
-    // Mirrored by island_softmax3_fwd; keep these seed and harvest loops in
-    // lockstep with runtime/src/program_softmax.cpp.
     for (size_t k = 0; k < p.ins.size(); ++k) {
       const auto& li = p.ins[k];
       const int input = li.input >= 0 ? li.input : (int)k;
@@ -112,6 +110,8 @@ void island_fwd_impl(KernelCtx& ctx) {
 
 void island_fwd(KernelCtx& ctx) { island_fwd_impl<false>(ctx); }
 
+}  // namespace
+
 // Shared input descriptors and mutable registers retain the additive boundary:
 // their separate local cells do not represent one persistent external adjoint.
 bool continue_input_adjoints(const IslandProg& p, const KernelCtx& ctx) {
@@ -129,6 +129,8 @@ bool continue_input_adjoints(const IslandProg& p, const KernelCtx& ctx) {
   }
   return true;
 }
+
+namespace {
 
 // The generated backward: seed the live-outs, sweep, harvest the live-ins.
 void island_bwd_native(const IslandProg& p, KernelCtx& ctx) {

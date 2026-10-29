@@ -20,6 +20,7 @@
 #ifndef STANLI_PROGRAM_HPP
 #define STANLI_PROGRAM_HPP
 
+#include <stanli/adjoint_rules.hpp>
 #include <stanli/callable_transform.hpp>
 #include <stanli/extrema_grouping.hpp>
 #include <stanli/kernel_types.hpp>
@@ -87,8 +88,8 @@ inline constexpr int32_t kProgramExtremaPhaseShift = 3;
   X(SUB, kProgramReadB)                                                       \
   X(MUL, kProgramReadB | kProgramSaveA | kProgramSaveB)                       \
   X(DIV, kProgramReadB | kProgramSaveA | kProgramSaveB | kProgramSaveOut)     \
-  X(IMOD, kProgramReadB | kProgramNoAdjoint)                                  \
-  X(IDIV, kProgramReadB | kProgramNoAdjoint)                                  \
+  X(IMOD, kProgramReadB)                                                      \
+  X(IDIV, kProgramReadB)                                                      \
   X(IADD, kProgramReadB)                                                      \
   X(ISUB, kProgramReadB)                                                      \
   X(IMUL, kProgramReadB)                                                      \
@@ -117,7 +118,7 @@ inline constexpr int32_t kProgramExtremaPhaseShift = 3;
   X(NE, kProgramReadB)                                                        \
   X(DYN_SET, kProgramRangeA | kProgramReadB | kProgramReadC |                 \
                  kProgramRangeOutput | kProgramNoAdjoint)                     \
-  X(DYN_INDEX, kProgramReadB | kProgramNoAdjoint)                             \
+  X(DYN_INDEX, kProgramReadB | kProgramSaveB)                                 \
   /* b selects max (1) or min (0); c stores kProgramExtrema* metadata. */     \
   X(EXTREMA_RANGE, kProgramRangeA | kProgramNoAdjoint)                        \
   X(JZ, kProgramNoAdjoint | kProgramNoOutput)                                 \
@@ -132,6 +133,7 @@ inline constexpr int32_t kProgramExtremaPhaseShift = 3;
   X(SOFTMAX, kProgramRangeA | kProgramSaveOut | kProgramRangeOutput)          \
   X(LSE2, kProgramReadB | kProgramSaveA | kProgramSaveB)                      \
   X(LOG_DIFF_EXP, kProgramReadB | kProgramSaveA | kProgramSaveB)              \
+  X(LMULTIPLY, kProgramReadB | kProgramSaveA | kProgramSaveB)                 \
   X(LOG_MIX, kProgramReadB | kProgramReadC | kProgramSaveA | kProgramSaveB |  \
                  kProgramSaveC)                                               \
   X(FMA, kProgramReadB | kProgramReadC | kProgramSaveA | kProgramSaveB)       \
@@ -148,7 +150,13 @@ inline constexpr int32_t kProgramExtremaPhaseShift = 3;
   X(REJECT, kProgramNoInputs | kProgramNoAdjoint | kProgramNoOutput)          \
   X(DENSITY_VEC, kProgramNoAdjoint)                                           \
   /* An elementwise rule (sub) over len elements; see Instr. */               \
-  X(RANGE, 0)
+  X(RANGE, 0)                                                                 \
+  X(ERFC, kProgramSaveA)                                                      \
+  X(LOG1P, kProgramSaveA)                                                     \
+  X(LOG1M_EXP, kProgramSaveA)                                                 \
+  X(INV_SQUARE, kProgramSaveA)                                                \
+  /* Appends segment a to the trail counted at dst; len is its capacity+1. */ \
+  X(PATH, kProgramNoInputs | kProgramRangeOutput | kProgramNoAdjoint)
 
 struct Program {
   enum Code : uint8_t {
@@ -371,7 +379,7 @@ inline constexpr int program_input_len(const Program::Instr& instr, int k) {
   return 1;
 }
 
-static_assert(program_code_count() == static_cast<size_t>(Program::RANGE) + 1,
+static_assert(program_code_count() == static_cast<size_t>(Program::PATH) + 1,
               "every Program::Code needs exactly one ProgramOpSpec");
 
 // Sink constant range fills past paths that never access their registers.
@@ -384,6 +392,9 @@ bool elide_program_dead_constants(Program& p);
 
 // Acyclic CFG version, retaining arithmetic and refusing unmodelled spans.
 bool elide_acyclic_program_constants(Program& p);
+
+bool propagate_program_copies(Program& p,
+                              const std::vector<std::pair<int, int>>& seeded);
 
 // Prove definite initialization at every read and exit across the CFG. CALL
 // scratch is private during var replay and therefore is not a register write.
@@ -412,6 +423,9 @@ bool compact_program_gated(Program& p, std::vector<std::pair<int, int>>& seeded,
 // Assemble the forward context for `call` over the register file `reg`.
 // Backward-only fields are left null; run_adjoint fills its own.
 KernelCtx call_fwd_ctx(const Program::Call& call, double* reg);
+
+void bind_call_fwd_ctx(const Program::Call& call, double* reg, KernelCtx& ctx,
+                       EvalState* state);
 
 // Resolve a manually constructed call site once. Production carvers already
 // have the Kernel in hand and bind its pointers directly. False leaves the
@@ -508,6 +522,27 @@ inline T program_pow(uint8_t law, const T& a, const T& b) {
   }
 }
 
+// Elements to store one at a time before `dst` reaches a 64-byte boundary.
+inline int fill_head_elements(const void* dst, int len) {
+  const auto misaligned = reinterpret_cast<uintptr_t>(dst) & 63u;
+  const int head = static_cast<int>(((64u - misaligned) & 63u) >> 3);
+  return head < len ? head : len;
+}
+
+template <typename T>
+inline void fill_registers(T* dst, int len, const T& value) {
+  constexpr int kPeelMin = 16;
+  if constexpr (sizeof(T) == 8) {
+    if (len >= kPeelMin) {
+      const int head = fill_head_elements(dst, len);
+      std::fill_n(dst, head, value);
+      dst += head;
+      len -= head;
+    }
+  }
+  std::fill_n(dst, len, value);
+}
+
 template <bool ReuseCallCtx, typename T>
 __attribute__((aligned(64))) void run_program_impl(const Program& p, T* reg,
                                                    EvalState* state = nullptr) {
@@ -531,13 +566,20 @@ __attribute__((aligned(64))) void run_program_impl(const Program& p, T* reg,
         break;
       case Program::FILL: {
         const T value(p.pool[(size_t)I.a]);
-        std::fill_n(reg + I.dst, I.len, value);
+        fill_registers(reg + I.dst, I.len, value);
         break;
       }
       case Program::CONSTR:
         for (int32_t i = 0; i < I.len; ++i)
           reg[(size_t)(I.dst + i)] = T(p.pool[(size_t)(I.a + i)]);
         break;
+      case Program::PATH: {
+        const int32_t taken =
+            static_cast<int32_t>(stan::math::value_of(reg[(size_t)I.dst]));
+        reg[(size_t)(I.dst + 1 + taken)] = T(I.a);
+        reg[(size_t)I.dst] = T(taken + 1);
+        break;
+      }
       case Program::MOV:
         d() = ra();
         break;
@@ -602,36 +644,12 @@ __attribute__((aligned(64))) void run_program_impl(const Program& p, T* reg,
       case Program::NEG:
         d() = -ra();
         break;
-      case Program::EXP:
-        d() = stan::math::exp(ra());
-        break;
-      case Program::LOG:
-        d() = stan::math::log(ra());
-        break;
-      case Program::SQRT:
-        d() = stan::math::sqrt(ra());
-        break;
-      case Program::SQUARE:
-        d() = stan::math::square(ra());
-        break;
-      case Program::INV:
-        d() = stan::math::inv(ra());
-        break;
-      case Program::FABS:
-        d() = stan::math::fabs(ra());
-        break;
-      case Program::INV_LOGIT:
-        d() = stan::math::inv_logit(ra());
-        break;
-      case Program::LOG1M:
-        d() = stan::math::log1m(ra());
-        break;
-      case Program::LOG1P_EXP:
-        d() = stan::math::log1p_exp(ra());
-        break;
-      case Program::TANH:
-        d() = stan::math::tanh(ra());
-        break;
+#define STANLI_PROGRAM_UNARY_FORWARD(code, fn, from_out, pullback) \
+  case Program::code:                                              \
+    d() = stan::math::fn(ra());                                    \
+    break;
+        STANLI_PROGRAM_UNARY_LIST(STANLI_PROGRAM_UNARY_FORWARD)
+#undef STANLI_PROGRAM_UNARY_FORWARD
       case Program::GT:
         d() = T(stan::math::value_of(ra()) > stan::math::value_of(rb()));
         break;
@@ -800,6 +818,9 @@ __attribute__((aligned(64))) void run_program_impl(const Program& p, T* reg,
         break;
       case Program::LOG_DIFF_EXP:
         d() = stan::math::log_diff_exp(ra(), rb());
+        break;
+      case Program::LMULTIPLY:
+        d() = stan::math::multiply_log(ra(), rb());
         break;
       case Program::LOG_MIX:
         d() = stan::math::log_mix(ra(), rb(), reg[(size_t)I.c]);

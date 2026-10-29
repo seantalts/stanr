@@ -25,6 +25,7 @@
 #include <stanli/recorder.hpp>
 
 #include <stanli/adjoint.hpp>
+#include <stanli/adjoint_rules.hpp>
 #include <stanli/island.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/program_density.hpp>
@@ -36,11 +37,12 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace stanli {
 
-bool gen_adjoint(IslandProg& p) {
+bool gen_adjoint(IslandProg& p, bool keep_every_clear) {
   Program& fwd = p;
   const std::vector<Program::Instr> orig = fwd.code;
   const int n0 = fwd.n_regs;
@@ -74,6 +76,10 @@ bool gen_adjoint(IslandProg& p) {
     }
     if (program_spec_of(I).has(kProgramNoAdjoint) && !jump &&
         I.code != Program::REJECT && I.code != Program::EXTREMA_RANGE)
+      return false;
+    if (I.code == Program::DYN_INDEX &&
+        !(I.len > 0 && I.a >= 0 && I.a <= n0 && I.c >= 0 && I.c <= n0 &&
+          in_range(I.a + I.c, I.len) && in_range(I.b, 1)))
       return false;
     if (I.code != Program::CALL) continue;
     if (I.a < 0 || (size_t)I.a >= fwd.calls.size()) return false;
@@ -134,6 +140,8 @@ bool gen_adjoint(IslandProg& p) {
     if (I.code == Program::DENSITY && program_density_arity(I.len) > 3)
       for (int k = 0; k < program_density_arity(I.len); ++k)
         if (I.a + k >= 0 && I.a + k < n0) no_alias[(size_t)(I.a + k)] = 1;
+    if (I.code == Program::DYN_INDEX)
+      for (int k = 0; k < I.len; ++k) no_alias[(size_t)(I.a + I.c + k)] = 1;
     if (I.code == Program::CALL) {
       // The kernel's backward accumulates adjoints over whole ranges, so
       // every CALL range keeps identity adjoint cells.
@@ -157,6 +165,7 @@ bool gen_adjoint(IslandProg& p) {
   for (const auto& I : orig) {
     const ProgramOpSpec& spec = program_spec_of(I);
     const int reads = spec.has(kProgramNoInputs) ? 0 : 3;
+    if (I.code == Program::DYN_INDEX) continue;
     if (I.code == Program::DENSITY && program_density_arity(I.len) > 3 &&
         !in_range(I.a, program_density_arity(I.len)))
       return false;
@@ -205,7 +214,7 @@ bool gen_adjoint(IslandProg& p) {
   const auto comparison = [](Program::Code code) {
     return code == Program::GT || code == Program::GE || code == Program::LT ||
            code == Program::LE || code == Program::EQ || code == Program::NE ||
-           (code >= Program::IADD && code <= Program::IABS);
+           (code >= Program::IMOD && code <= Program::IABS);
   };
   for (size_t pc = orig.size(); pc-- > 0;) {
     const auto& I = orig[pc];
@@ -227,6 +236,10 @@ bool gen_adjoint(IslandProg& p) {
         needed[I.a + k] = 1;
       continue;
     }
+    if (I.code == Program::DYN_INDEX) {
+      for (int k = 0; k < I.len; ++k) needed[I.a + I.c + k] = 1;
+      continue;
+    }
     for (int k = 0; k < 3; ++k)
       if (program_reads(I, k)) {
         const int r = k == 0 ? I.a : (k == 1 ? I.b : I.c);
@@ -240,44 +253,67 @@ bool gen_adjoint(IslandProg& p) {
     // Definite initialization over the forward DAG also proves that a
     // conditional single-writer copy dominates every use of its value. This
     // preserves the existing adjoint-cell sharing rule on untaken paths.
-    // Bound analysis storage; larger programs keep the established replay.
-    const size_t count = orig.size() + 1;
-    if (n0 <= 0 || count > (4u << 20) / static_cast<size_t>(n0)) return false;
-    std::vector<unsigned char> defined(count * static_cast<size_t>(n0), 0);
-    std::vector<unsigned char> reached(count, 0);
-    reached[0] = 1;
+    if (n0 <= 0) return false;
+    std::vector<int> tracked((size_t)n0, 0);
     for (const auto& in : p.ins) {
       if (!in_range(in.reg, in.len)) return false;
-      std::fill_n(defined.data() + in.reg, in.len, 1);
+      std::fill_n(tracked.begin() + in.reg, in.len, -1);
     }
-    const auto propagate = [&](size_t target, const unsigned char* values) {
-      auto* dest = defined.data() + target * n0;
-      if (!reached[target])
-        std::copy_n(values, n0, dest);
-      else
-        for (int r = 0; r < n0; ++r) dest[r] &= values[r];
-      reached[target] = 1;
+    int m = 0;
+    for (int& t : tracked) t = t < 0 ? -1 : m++;
+    const size_t words = (static_cast<size_t>(m) + 63) / 64;
+    using Bits = std::vector<uint64_t>;
+    Bits values(words, 0);
+    bool live = true;
+    std::unordered_map<size_t, Bits> pending;
+    const auto propagate = [&](size_t target) {
+      auto [it, fresh] = pending.try_emplace(target, values);
+      if (fresh) return;
+      for (size_t w = 0; w < words; ++w) it->second[w] &= values[w];
+    };
+    const auto arrive = [&](size_t pc) {
+      auto it = pending.find(pc);
+      if (it == pending.end()) return;
+      if (live) {
+        for (size_t w = 0; w < words; ++w) values[w] &= it->second[w];
+      } else {
+        values = std::move(it->second);
+        live = true;
+      }
+      pending.erase(it);
+    };
+    const auto is_defined = [&](int t) {
+      return (values[(size_t)t / 64] >> (t % 64)) & 1u;
     };
     for (size_t pc = 0; pc < orig.size(); ++pc) {
-      if (!reached[pc]) continue;
+      arrive(pc);
+      if (!live) continue;
       const auto& I = orig[pc];
-      auto* values = defined.data() + pc * n0;
       const auto available = [&](int r, int len) {
         if (!in_range(r, len)) return false;
         for (int k = 0; k < len; ++k)
-          if (!values[r + k]) return false;
+          if (tracked[(size_t)(r + k)] >= 0 &&
+              !is_defined(tracked[(size_t)(r + k)]))
+            return false;
         return true;
+      };
+      const auto define = [&](int r, int len) {
+        for (int k = 0; k < len; ++k) {
+          const int t = tracked[(size_t)(r + k)];
+          if (t >= 0) values[(size_t)t / 64] |= uint64_t{1} << (t % 64);
+        }
       };
       if (I.code == Program::CALL) {
         const auto& call = fwd.calls[static_cast<size_t>(I.a)];
         for (int k = 0; k < call.n_in; ++k)
           if (!available(call.in[k], call.in_len[k])) return false;
-        if (call.out_len) std::fill_n(values + call.out, call.out_len, 1);
-        if (call.scratch_len)
-          std::fill_n(values + call.scratch, call.scratch_len, 1);
+        if (call.out_len) define(call.out, call.out_len);
+        if (call.scratch_len) define(call.scratch, call.scratch_len);
       } else {
         if (I.code == Program::DENSITY && program_density_arity(I.len) > 3) {
           if (!available(I.a, program_density_arity(I.len))) return false;
+        } else if (I.code == Program::DYN_INDEX) {
+          if (!available(I.a + I.c, I.len) || !available(I.b, 1)) return false;
         } else {
           for (int k = 0; k < 3; ++k)
             if (program_reads(I, k) &&
@@ -286,22 +322,25 @@ bool gen_adjoint(IslandProg& p) {
               return false;
         }
         const int width = program_output_len(I);
-        if (width) std::fill_n(values + I.dst, width, 1);
+        if (width) define(I.dst, width);
       }
       if (I.code == Program::REJECT) {
         const auto& message = fwd.messages[I.a];
         for (size_t k = 0; k < message.value_reg.size(); ++k)
           if (!available(message.value_reg[k], message.value_len[k]))
             return false;
+        live = false;
         continue;
       }
       if (I.code == Program::JZ || I.code == Program::JMP)
-        propagate(I.dst, values);
-      if (I.code != Program::JMP) propagate(pc + 1, values);
+        propagate(static_cast<size_t>(I.dst));
+      if (I.code == Program::JMP) live = false;
     }
-    if (!reached.back()) return false;
+    arrive(orig.size());
+    if (!live) return false;
     for (int r : p.out_regs)
-      if (!defined[orig.size() * n0 + r]) return false;
+      if (tracked[(size_t)r] >= 0 && !is_defined(tracked[(size_t)r]))
+        return false;
     leaders.push_back(static_cast<int>(orig.size()));
     std::sort(leaders.begin(), leaders.end());
     leaders.erase(std::unique(leaders.begin(), leaders.end()), leaders.end());
@@ -352,6 +391,8 @@ bool gen_adjoint(IslandProg& p) {
         }
         dmask[i] = (uint8_t)m;
         any = m != 0;
+      } else if (I.code == Program::DYN_INDEX) {
+        read(I.a + I.c, I.len);
       } else {
         read(I.a, program_input_len(I, 0));
         if (spec.has(kProgramReadB)) read(I.b, program_input_len(I, 1));
@@ -401,6 +442,32 @@ bool gen_adjoint(IslandProg& p) {
     return true;
   };
 
+  auto produces_adjoint = [&](const Program::Instr& I, int i) {
+    if (I.code == Program::CALL) return true;
+    if (aliasable(I, i)) return false;
+    const int wl = program_output_len(I);
+    if (wl == 0) return false;
+    const ProgramOpSpec& spec = program_spec_of(I);
+    const bool only_clear =
+        spec.has(kProgramNoInputs) ||
+        (I.code >= Program::GT && I.code <= Program::NE) ||
+        (I.code >= Program::IMOD && I.code <= Program::IABS) ||
+        I.code == Program::EXTREMA_RANGE;
+    if (!keep_every_clear && only_clear) {
+      bool private_first = true;
+      for (int k = 0; k < wl; ++k)
+        private_first &= first_write[I.dst + k] == i && !no_alias[I.dst + k];
+      if (private_first) return false;
+    }
+    return true;
+  };
+  std::vector<int> segment_of((size_t)nblocks, -1);
+  int nsegments = 0;
+  if (control)
+    for (int i = 0; i < (int)orig.size(); ++i)
+      if (produces_adjoint(orig[(size_t)i], i) && segment_of[block[i]] < 0)
+        segment_of[block[i]] = nsegments++;
+
   // Discover every shared cell before emitting the adjoint instructions.
   // Besides making their indices final for map1/mapn below, this lets the
   // file store one double per equivalence class rather than retaining holes
@@ -435,24 +502,21 @@ bool gen_adjoint(IslandProg& p) {
     return base;
   };
 
-  int n_regs = n0 + nblocks;
-  const bool elide_private_clears =
-      std::getenv("STANLI_NO_PRIVATE_ADJOINT_CLEARS") == nullptr;
+  const bool trail = control && nsegments > 0;
+  int n_regs = n0 + nsegments + trail;
   std::vector<double> pool;
   std::vector<int> pc_map(orig.size() + 1), adj_starts(nblocks + 1);
-  int flag_one = 0;
   if (control) {
     pool = fwd.pool;
-    const int zeros = static_cast<int>(pool.size());
-    pool.resize(pool.size() + nblocks, 0.0);
-    flag_one = static_cast<int>(pool.size());
-    pool.push_back(1.0);
-    Program::Instr clear;
-    clear.code = Program::CONSTR;
-    clear.dst = n0;
-    clear.a = zeros;
-    clear.len = nblocks;
-    ncode.push_back(clear);
+    if (trail) {
+      const int zero = static_cast<int>(pool.size());
+      pool.push_back(0.0);
+      Program::Instr clear;
+      clear.code = Program::CONST;
+      clear.dst = n0;
+      clear.a = zero;
+      ncode.push_back(clear);
+    }
   }
   auto checkpoint = [&](int r, int len, bool needed) {
     if (!needed) return r;
@@ -481,11 +545,14 @@ bool gen_adjoint(IslandProg& p) {
     pc_map[i] = static_cast<int>(ncode.size());
     if (control && leaders[block[i]] == i) {
       adj_starts[block[i]] = static_cast<int>(ap.code.size());
-      Program::Instr flag;
-      flag.code = Program::CONST;
-      flag.dst = n0 + block[i];
-      flag.a = flag_one;
-      ncode.push_back(flag);
+      if (segment_of[block[i]] >= 0) {
+        Program::Instr path;
+        path.code = Program::PATH;
+        path.dst = n0;
+        path.a = segment_of[block[i]];
+        path.len = nsegments + 1;
+        ncode.push_back(path);
+      }
     }
     if (I.code == Program::CALL) {
       Program::Call call = fwd.calls[(size_t)I.a];
@@ -579,17 +646,7 @@ bool gen_adjoint(IslandProg& p) {
     // definition there is no earlier value to differentiate, so that final
     // clear has no reader. Live-ins and shared cells retain their clears;
     // each invocation starts with a zeroed adjoint file.
-    const bool only_clear =
-        spec.has(kProgramNoInputs) ||
-        (I.code >= Program::GT && I.code <= Program::NE) ||
-        (I.code >= Program::IADD && I.code <= Program::IABS) ||
-        I.code == Program::EXTREMA_RANGE;
-    if (elide_private_clears && only_clear) {
-      bool private_first = true;
-      for (int k = 0; k < wl; ++k)
-        private_first &= first_write[I.dst + k] == i && !no_alias[I.dst + k];
-      if (private_first) continue;
-    }
+    if (!produces_adjoint(I, i)) continue;
 
     // An output value is needed as this instruction LEFT it, so only a
     // later overwrite can lose it.
@@ -609,6 +666,10 @@ bool gen_adjoint(IslandProg& p) {
         A.b = map1(I.b);
         A.c = map1(I.c);
       }
+    } else if (I.code == Program::DYN_INDEX) {
+      A.a = mapn(I.a + I.c, I.len);
+      A.b = 0;
+      A.c = 0;
     } else if (!spec.has(kProgramNoInputs) &&
                I.code != Program::EXTREMA_RANGE) {
       A.a = mapn(I.a, program_input_len(I, 0));
@@ -626,10 +687,16 @@ bool gen_adjoint(IslandProg& p) {
         I.dst = pc_map[I.dst];
     const int total = static_cast<int>(ap.code.size());
     adj_starts.back() = total;
+    if (trail) {
+      ap.trail = n0;
+      ap.segments.assign((size_t)nsegments, {0, 0});
+    }
     for (int b = nblocks; b-- > 0;)
-      if (adj_starts[b] != adj_starts[b + 1])
-        ap.segments.push_back(
-            {n0 + b, total - adj_starts[b + 1], total - adj_starts[b]});
+      if (adj_starts[b] != adj_starts[b + 1]) {
+        if (segment_of[b] < 0) return false;
+        ap.segments[(size_t)segment_of[b]] = {total - adj_starts[b + 1],
+                                              total - adj_starts[b]};
+      }
     fwd.pool = std::move(pool);
   }
   std::reverse(ap.code.begin(), ap.code.end());
@@ -651,114 +718,6 @@ bool gen_adjoint(IslandProg& p) {
 // in-place `x = exp(x)` needs.
 using AdjA = Eigen::Map<Eigen::ArrayXd>;
 using CAdjA = Eigen::Map<const Eigen::ArrayXd>;
-
-// The rules with more to them than one expression, shared by the scalar
-// sweep and the ranged one. `t` is the output adjoint, already consumed
-// from its cell.
-static void pow_rule(uint8_t law, double t, double va, double vb, double vd,
-                     double& adj_a, double& adj_b) {
-  if (va == 0.0) {
-    adj_a += pow_zero_base_partial(law, t, va, vb);
-    return;
-  }
-  const double m = t * vd;
-  adj_a += m * vb / va;
-  adj_b += m * std::log(va);
-}
-
-// fmax/fmin build no node at all: they return whichever operand won,
-// so the whole adjoint routes to it. Which operand wins a tie is an
-// instantiation property: the var,var overloads compare `a > b`
-// (ties to b) where var,double compares `a >= b` (ties to the var),
-// and a mixed call whose constant side wins returns a fresh constant
-// that carries no adjoint at all. `law` holds the operands' activity
-// from lowering (bit 0: a, bit 1: b; 0 is the legacy all-var form),
-// matching program_extremum's replay. NaN needs saying separately --
-// `a > b` is false when either is NaN, so the plain comparison would
-// hand fmax(x, NaN) to the NaN, where stan-math returns x. A local
-// declared and never assigned is NaN (mir_prog.hpp), so this is
-// reachable and not hypothetical.
-static void extremum_rule(bool maximum, uint8_t law, double t, double x,
-                          double y, double& adj_a, double& adj_b) {
-  const bool a_active = law == 0 || (law & 0x1u) != 0;
-  const bool b_active = law == 0 || (law & 0x2u) != 0;
-  if (std::isnan(x) && std::isnan(y)) {
-    if (a_active) adj_a = std::numeric_limits<double>::quiet_NaN();
-    if (b_active) adj_b = std::numeric_limits<double>::quiet_NaN();
-  } else if (std::isnan(y)) {
-    if (a_active) adj_a += t;
-  } else if (std::isnan(x)) {
-    if (b_active) adj_b += t;
-  } else {
-    const bool a_wins = a_active && !b_active ? (maximum ? x >= y : x <= y)
-                                              : (maximum ? x > y : x < y);
-    if (a_wins) {
-      if (a_active) adj_a += t;
-    } else if (b_active) {
-      adj_b += t;
-    }
-  }
-}
-
-// At exactly zero stan-math returns a fresh node with no operand, so the
-// derivative is dropped rather than being either sign; at NaN it poisons
-// the operand's adjoint outright, which is what makes a sampler reject the
-// draw rather than accept a finite gradient computed from nothing.
-static void fabs_rule(double t, double x, double& adj_a) {
-  if (std::isnan(x))
-    adj_a = std::numeric_limits<double>::quiet_NaN();
-  else if (x > 0.0)
-    adj_a += t;
-  else if (x < 0.0)
-    adj_a -= t;
-}
-
-static void lse2_rule(double t, double va, double vb, double& adj_a,
-                      double& adj_b) {
-  adj_a += t * stan::math::inv_logit(va - vb);
-  adj_b += t * stan::math::inv_logit(vb - va);
-}
-
-// Match rev/fun/log_diff_exp.hpp exactly. Besides being stable when the
-// arguments are close, expm1 has observably different rounding from
-// spelling either denominator with exp.
-static void log_diff_exp_rule(double t, double va, double vb, double& adj_a,
-                              double& adj_b) {
-  adj_a -= t / stan::math::expm1(vb - va);
-  adj_b -= t / stan::math::expm1(va - vb);
-}
-
-// rev/fun/log_mix.hpp: partials through the helper, with the arms swapped
-// when lambda1 <= lambda2 so the exponential cannot overflow. Transcribed
-// rather than reused because log_mix's partials live in the rev overload,
-// which rvar cannot select.
-static void log_mix_rule(double t, double va, double vb, double vc,
-                         double& adj_a, double& adj_b, double& adj_c) {
-  double theta_d = va;
-  const double lam1 = vb, lam2 = vc;
-  double one_m_exp, one_m_t_prod, one_d;
-  auto helper = [&](double th, double la, double lb) {
-    const double e = std::exp(lb - la);
-    one_m_exp = 1.0 - e;
-    const double one_m_t = 1.0 - th;
-    one_m_t_prod = one_m_t * e;
-    one_d = 1.0 / (th + one_m_t_prod);
-  };
-  if (lam1 > lam2) {
-    helper(theta_d, lam1, lam2);
-  } else {
-    helper(1.0 - theta_d, lam2, lam1);
-    one_m_exp = -one_m_exp;
-    const double swapped = one_m_t_prod;
-    one_m_t_prod = 1.0 - theta_d;
-    theta_d = swapped;
-  }
-  // Descending operand order, as the propagator's per-edge tape entries
-  // unwind.
-  adj_c += t * (one_m_t_prod * one_d);
-  adj_b += t * (theta_d * one_d);
-  adj_a += t * (one_m_exp * one_d);
-}
 
 template <int32_t SA, int32_t SB, int32_t SC, typename Body>
 static void strided(int32_t n, Body body) {
@@ -889,59 +848,15 @@ __attribute__((noinline)) static void ranged_step(const AdjInstr& I,
         adj[I.a + ka] -= take(k);
       });
       break;
-    case Program::EXP:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) * val[I.vd + k];
-      });
-      break;
-    case Program::LOG:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) / val[I.va + ka];
-      });
-      break;
-    case Program::SQRT:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        const double u = take(k);
-        if (val[I.vd + k] != 0.0) adj[I.a + ka] += u / (2.0 * val[I.vd + k]);
-      });
-      break;
-    case Program::SQUARE:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) * 2.0 * val[I.va + ka];
-      });
-      break;
-    case Program::INV:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] -= take(k) / (val[I.va + ka] * val[I.va + ka]);
-      });
-      break;
-    case Program::FABS:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        fabs_rule(take(k), val[I.va + ka], adj[I.a + ka]);
-      });
-      break;
-    case Program::INV_LOGIT:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) * val[I.vd + k] * (1.0 - val[I.vd + k]);
-      });
-      break;
-    case Program::LOG1M:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) / (val[I.va + ka] - 1.0);
-      });
-      break;
-    case Program::LOG1P_EXP:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        adj[I.a + ka] += take(k) * stan::math::inv_logit(val[I.va + ka]);
-      });
-      break;
-    case Program::TANH:
-      unary([&](int32_t k, int32_t ka, int32_t, int32_t) {
-        const double u = take(k);
-        const double ch = std::cosh(val[I.va + ka]);
-        adj[I.a + ka] += u / (ch * ch);
-      });
-      break;
+#define STANLI_UNARY_RANGED(code, fn, from_out, pullback)                \
+  case Program::code:                                                    \
+    unary([&](int32_t k, int32_t ka, int32_t, int32_t) {                 \
+      STANLI_UNARY_PULLBACK(from_out, pullback, take(k), val[I.va + ka], \
+                            val[I.vd + k], adj[I.a + ka])                \
+    });                                                                  \
+    break;
+      STANLI_PROGRAM_UNARY_LIST(STANLI_UNARY_RANGED)
+#undef STANLI_UNARY_RANGED
     case Program::LSE2:
       binary([&](int32_t k, int32_t ka, int32_t kb, int32_t) {
         lse2_rule(take(k), val[I.va + ka], val[I.vb + kb], adj[I.a + ka],
@@ -952,6 +867,12 @@ __attribute__((noinline)) static void ranged_step(const AdjInstr& I,
       binary([&](int32_t k, int32_t ka, int32_t kb, int32_t) {
         log_diff_exp_rule(take(k), val[I.va + ka], val[I.vb + kb],
                           adj[I.a + ka], adj[I.b + kb]);
+      });
+      break;
+    case Program::LMULTIPLY:
+      binary([&](int32_t k, int32_t ka, int32_t kb, int32_t) {
+        lmultiply_rule(take(k), val[I.va + ka], val[I.vb + kb], adj[I.a + ka],
+                       adj[I.b + kb]);
       });
       break;
     case Program::LOG_MIX:
@@ -1087,51 +1008,14 @@ __attribute__((aligned(64))) void run_adjoint(const Program& fwd,
           adj[I.dst] = 0.0;
           adj[I.a] -= t;
           break;
-        case Program::EXP:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t * val[I.vd];
-          break;
-        case Program::LOG:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t / val[I.va];
-          break;
-        case Program::SQRT:
-          adj[I.dst] = 0.0;
-          if (val[I.vd] != 0.0) adj[I.a] += t / (2.0 * val[I.vd]);
-          break;
-        case Program::SQUARE:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t * 2.0 * val[I.va];
-          break;
-        case Program::INV:
-          adj[I.dst] = 0.0;
-          adj[I.a] -= t / (val[I.va] * val[I.va]);
-          break;
-        case Program::FABS:
-          adj[I.dst] = 0.0;
-          fabs_rule(t, val[I.va], adj[I.a]);
-          break;
-        case Program::INV_LOGIT:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t * val[I.vd] * (1.0 - val[I.vd]);
-          break;
-        case Program::LOG1M:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t / (val[I.va] - 1.0);
-          break;
-        // The derivative stan-math precomputes for its own reverse rule, and
-        // the one OP_LOG1P_EXP carries on the graph side: the two paths have
-        // to agree to the bit, and one expression is how that stays true.
-        case Program::LOG1P_EXP:
-          adj[I.dst] = 0.0;
-          adj[I.a] += t * stan::math::inv_logit(val[I.va]);
-          break;
-        case Program::TANH: {
-          adj[I.dst] = 0.0;
-          const double ch = std::cosh(val[I.va]);
-          adj[I.a] += t / (ch * ch);
-          break;
-        }
+#define STANLI_UNARY_SCALAR(code, fn, from_out, pullback)              \
+  case Program::code:                                                  \
+    adj[I.dst] = 0.0;                                                  \
+    STANLI_UNARY_PULLBACK(from_out, pullback, t, val[I.va], val[I.vd], \
+                          adj[I.a])                                    \
+    break;
+          STANLI_PROGRAM_UNARY_LIST(STANLI_UNARY_SCALAR)
+#undef STANLI_UNARY_SCALAR
         // Comparisons produce a plain 0/1 the forward already computed; they
         // have no derivative, but they did write the register.
         case Program::GT:
@@ -1140,6 +1024,8 @@ __attribute__((aligned(64))) void run_adjoint(const Program& fwd,
         case Program::LE:
         case Program::EQ:
         case Program::NE:
+        case Program::IMOD:
+        case Program::IDIV:
         case Program::IADD:
         case Program::ISUB:
         case Program::IMUL:
@@ -1218,6 +1104,10 @@ __attribute__((aligned(64))) void run_adjoint(const Program& fwd,
           adj[I.dst] = 0.0;
           log_diff_exp_rule(t, val[I.va], val[I.vb], adj[I.a], adj[I.b]);
           break;
+        case Program::LMULTIPLY:
+          adj[I.dst] = 0.0;
+          lmultiply_rule(t, val[I.va], val[I.vb], adj[I.a], adj[I.b]);
+          break;
         case Program::LOG_MIX:
           adj[I.dst] = 0.0;
           log_mix_rule(t, val[I.va], val[I.vb], val[I.vc], adj[I.a], adj[I.b],
@@ -1251,11 +1141,12 @@ __attribute__((aligned(64))) void run_adjoint(const Program& fwd,
         case Program::RANGE:
           ranged_step(I, val, adj);
           break;
+        case Program::DYN_INDEX:
+          adj[I.dst] = 0.0;
+          adj[I.a + static_cast<int32_t>(val[I.vb]) - 1] += t;
+          break;
         case Program::DYN_SET:
         case Program::DYN_LSE_RANGE:
-        case Program::IMOD:
-        case Program::DYN_INDEX:
-        case Program::IDIV:
         case Program::EXTREMA_RANGE:
         case Program::JZ:
         case Program::JMP:
@@ -1267,17 +1158,22 @@ __attribute__((aligned(64))) void run_adjoint(const Program& fwd,
         case Program::PRINT:
         case Program::REJECT:
         case Program::DENSITY_VEC:
+        case Program::PATH:
           break;  // gen_adjoint refuses these; unreachable
         case Program::CALL:
           break;  // handled before this switch
       }
     }
   };
-  if (ap.segments.empty())
+  if (ap.segments.empty()) {
     run_segment(0, static_cast<int>(ap.code.size()));
-  else
-    for (const auto& segment : ap.segments)
-      if (val[segment.guard] != 0.0) run_segment(segment.begin, segment.end);
+  } else {
+    for (int k = static_cast<int>(val[ap.trail]); k-- > 0;) {
+      const auto& segment =
+          ap.segments[static_cast<size_t>(val[ap.trail + 1 + k])];
+      run_segment(segment.begin, segment.end);
+    }
+  }
 }
 
 }  // namespace stanli

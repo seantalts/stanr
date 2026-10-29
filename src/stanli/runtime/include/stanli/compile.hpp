@@ -189,6 +189,9 @@ struct CompiledModel {
     // Drivers prefer it over the truncated graph (see wa_interp.hpp);
     // the graph remains the fast path whenever lowering completes.
     std::shared_ptr<WaInterp> interp;
+    // Lowered on a second thread, beside the log_prob lowering. For tests;
+    // nothing branches on it.
+    bool lowered_in_parallel = false;
 
     void bind(Executor& ex) const {
       for (const auto& f : fills) {
@@ -213,6 +216,9 @@ struct CompiledModel {
   std::vector<std::string> interpreter_fallbacks;
   // Reasons opt-in within-chain reduction sites kept ordinary lowering.
   std::vector<std::string> reduce_sum_fallbacks;
+  // Set when a serial compile has a reduce_sum that threads_per_chain > 1
+  // might split.
+  std::string reduce_sum_notice;
   // Transformed data drew from the construction seed, so this model is a
   // function of that seed as well as of its data. A host that runs with one
   // seed the way CmdStan does rebuilds under the run seed when this is set,
@@ -230,8 +236,9 @@ struct CompiledModel {
 // unsupported/small calls keep whole-slice lowering. See reduce_sum.hpp.
 struct CompileOptions {
   int reduce_sum_threads = 1;
-  int64_t reduce_sum_min_elements = 8192;
+  int64_t reduce_sum_min_chunk_ns = 30000;
   int reduce_sum_max_chunks = 1024;
+  bool fast_math = false;
 };
 CompiledModel compile_model(const std::string& mir_text, const DataMap& data,
                             unsigned seed = 1);
@@ -239,11 +246,23 @@ CompiledModel compile_model(const std::string& mir_text, const DataMap& data,
                             unsigned seed, const CompileOptions& options);
 
 // The warning a host shows once per model with interpreter_fallbacks, and
-// the compile error STANLI_NO_INTERPRETER turns it into. `probe_failure` is
-// what the interpreter threw when a host probed it.
+// the compile error STANLI_NO_INTERPRETER turns it into.
 std::string interpreter_error(const CompiledModel& cm);
-std::string interpreter_warning(const CompiledModel& cm,
-                                const std::string& probe_failure = "");
+std::string interpreter_warning(const CompiledModel& cm);
+// The error a host raises when the interpreter threw `failure` at every
+// probe point, leaving no columns to report.
+std::string interpreter_probe_error(const CompiledModel& cm,
+                                    const std::string& failure);
+
+// The unconstrained point for constrained `inits` keyed by parameter name,
+// written to `out` (n_unconstrained values). Throws std::runtime_error saying
+// why when the model has no usable inverse transforms. The JSON form takes a
+// null `json` as an empty document.
+void unconstrain_inits(const CompiledModel& cm,
+                       const std::map<std::string, DataMap::Entry>& inits,
+                       double* out);
+void unconstrain_inits_json(const CompiledModel& cm, const char* json,
+                            double* out);
 
 }  // namespace stanli
 

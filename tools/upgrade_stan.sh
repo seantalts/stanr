@@ -416,6 +416,8 @@ cp -Rf "$MATH_SRC"/lib/boost_*/boost/detail "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/core "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/container "$INC/boost"
 cp -Rf "$MATH_SRC"/lib/boost_*/boost/move "$INC/boost"
+# boost::container::small_vector, which Stanli uses, needs Boost.Intrusive.
+cp -Rf "$MATH_SRC"/lib/boost_*/boost/intrusive "$INC/boost"
 
 # Trim filename for CRAN 100-character limit
 mv "$INC/boost/math/special_functions/detail/hypergeometric_1F1_small_a_negative_b_by_ratio.hpp" \

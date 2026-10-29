@@ -9,8 +9,7 @@
 #include <stanli/structured_loop.hpp>
 #include <stanli/optable.hpp>
 #include <stanli/message_sink.hpp>
-#include <rapidjson/stringbuffer.h>
-#include <rapidjson/writer.h>
+#include <stanli/json_writer.hpp>
 
 #include <cstdlib>
 #include <stdexcept>
@@ -20,11 +19,10 @@ namespace {
 thread_local ExecutionTraceScope* current_scope = nullptr;
 
 struct Report {
-  rapidjson::StringBuffer buffer;
-  rapidjson::Writer<rapidjson::StringBuffer> w{buffer};
+  JsonWriter w;
   void str(const char* key, const std::string& value) {
     w.Key(key);
-    w.String(value.data(), static_cast<rapidjson::SizeType>(value.size()));
+    w.String(value.data(), value.size());
   }
   void number(const char* key, int64_t value) {
     w.Key(key);
@@ -41,7 +39,7 @@ struct Report {
   }
   std::string finish() {
     w.EndObject();
-    return buffer.GetString();
+    return w.str();
   }
   void trace(const ExecutionTrace* t) {
     w.Key("interpreter_events");
@@ -136,7 +134,7 @@ struct Report {
       str("children_status", "depth_limit");
       return;
     }
-    if (code == OP_ISLAND) {
+    if (code == OP_ISLAND || code == OP_REGION_MAP) {
       w.Key("region");
       w.StartObject();
       island(*static_cast<const IslandProg*>(data), id, reverse, depth);
@@ -225,6 +223,7 @@ void ExecutionTrace::check() const {
     throw std::runtime_error(
         "strict execution diagnostic: MIR interpreter use observed");
 }
+bool execution_trace_active() { return current_scope != nullptr; }
 void record_interpreter_event(const std::string& phase, const char* event) {
   bool forbidden = false;
   for (auto* scope = current_scope; scope; scope = scope->previous_) {
@@ -286,10 +285,16 @@ std::string execution_report(const CompiledModel& model,
   r.w.EndArray();
   return r.finish();
 }
-void report_execution_host(const char* host, const char* value_engine,
-                           const char* probe_status,
-                           const std::string& reason) {
+void report_execution_host(const char* host, const CompiledModel& cm,
+                           bool interpreter, bool bound_graph,
+                           const char* neither, const std::string& reason) {
   if (!execution_reporting_enabled()) return;
+  const char* value_engine = interpreter   ? "mir_interpreter"
+                             : bound_graph ? "bound_graph"
+                                           : neither;
+  const char* probe_status = cm.write_array && cm.write_array->interp
+                                 ? (interpreter ? "passed" : "failed")
+                                 : "not_required";
   Report r;
   r.start("execution_host_selection");
   r.str("host", host);

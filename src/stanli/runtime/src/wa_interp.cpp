@@ -347,6 +347,24 @@ double wa_probe_point(int64_t i, int variant) {
   }
 }
 
+int64_t probe_wa_columns(WaInterp& interp, const CompiledModel& cm,
+                         Executor& ex, std::string& failure) {
+  for (int variant = 0; variant < 3; ++variant) {
+    for (int64_t i = 0; i < ex.n_params(); ++i)
+      ex.params_data()[i] = wa_probe_point(i, variant);
+    try {
+      ex.run_forward_only();
+      WaRng probe(1);
+      const auto row = interp.eval(cm.constrained_env(ex), probe);
+      failure.clear();
+      return (int64_t)row.size();
+    } catch (const std::exception& e) {
+      failure = e.what();
+    }
+  }
+  return -1;
+}
+
 WaInterp::WaInterp(std::shared_ptr<const mir::Program> prog,
                    std::map<std::string, DataMap::Entry> base_env)
     : prog_(std::move(prog)), base_env_(std::move(base_env)) {
@@ -413,7 +431,7 @@ bool WaInterp::read_param(MirInterp<double>& in, const mir::Stmt& s,
   auto it = params.find(s.decl_id);
   if (it == params.end())
     throw CompileError(
-        "stanli write_array: no constrained value supplied "
+        "no constrained value supplied "
         "for parameter " +
         s.decl_id);
   DataMap::Entry e = it->second;
@@ -425,8 +443,7 @@ bool WaInterp::read_param(MirInterp<double>& in, const mir::Stmt& s,
       len *= dims.back();
     }
     if (len != (int64_t)std::max(e.r.size(), e.i.size()))
-      throw CompileError("stanli write_array: constrained shape mismatch for " +
-                         s.decl_id);
+      throw CompileError("constrained shape mismatch for " + s.decl_id);
     e.dims = std::move(dims);
   }
   in.env()[s.decl_id] = std::move(e);
@@ -448,7 +465,8 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
       for (size_t k = base->args.size(); k-- > 1;) {
         if (base->args[k].name != "IndexSingle")
           throw CompileError(
-              "stanli write_array: FnWriteParam under a non-scalar index");
+              "cannot name an output parameter written through a non-scalar "
+              "index");
         ixs.push_back(in.as_int(base->args[k].args[0]));
       }
       base = &base->args[0];
@@ -468,7 +486,7 @@ bool WaInterp::write_param(MirInterp<double>& in, const mir::Stmt& s,
       }
       if (idx >= ov.size())
         throw CompileError(
-            "stanli write_array: cannot name a substituted FnWriteParam");
+            "cannot name an output parameter after optimization");
       name = ov[idx];
     }
     last_written_ = name;

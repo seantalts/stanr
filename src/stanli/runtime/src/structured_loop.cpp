@@ -9,10 +9,13 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -155,7 +158,7 @@ void prepare_node(StructuredLoop& p, Node& n, unsigned depth,
       if (op.opcode == OP_SET_INDEX_INPLACE ||
           op.opcode == OP_SET_SLICE_INPLACE ||
           op.opcode == OP_SET_SLICE_STRIDED_INPLACE || op.opcode == OP_ISLAND ||
-          op.opcode == OP_LOOP)
+          op.opcode == OP_LOOP || op.opcode == OP_REGION_MAP)
         throw std::invalid_argument("unsupported structured body operation");
       if (out_seen[op.out] || (op.out2 >= 0 && out_seen[op.out2]) ||
           op.out2 == op.out)
@@ -818,6 +821,96 @@ int64_t fixed_scalar_index(const DynamicIndexSpec& p, const KernelCtx& c,
   return static_cast<int64_t>(raw) - 1;
 }
 
+template <class F>
+void index_positions(const DynamicIndexSpec& p, const KernelCtx& c, bool update,
+                     F&& f) {
+  const int64_t fixed = fixed_scalar_index(p, c, update);
+  if (fixed >= 0) {
+    f(0, fixed);
+    return;
+  }
+  selected_positions(p, validate_index(p, c, update), f);
+}
+
+bool selected_cells_constant(const std::vector<uint8_t>& cells,
+                             const DynamicIndexSpec& spec, const KernelCtx& c) {
+  const int64_t fixed = fixed_scalar_index(spec, c, false);
+  if (fixed >= 0) return cells[static_cast<size_t>(fixed)] != 0;
+  const IndexRuntime runtime = validate_index(spec, c, false);
+  // Capacity padding is not covered by the selection proof.
+  if (runtime.selected != c.out.len) return false;
+  bool constant = true;
+  selected_positions(spec, runtime, [&](int64_t, int64_t at) {
+    constant = constant && cells[static_cast<size_t>(at)];
+  });
+  return constant;
+}
+
+bool single_selection(const DynamicIndexSpec& spec) {
+  return spec.selected_size == 1 &&
+         std::all_of(spec.axes.begin(), spec.axes.end(), [](const auto& a) {
+           return a.kind == DynamicIndexSpec::Axis::Single && a.count == 1 &&
+                  a.count_input_offset < 0 && a.extent_input_offset < 0;
+         });
+}
+
+// For a single_selection whose successful first use proved immutable
+// descriptor/slot geometry. Fixed Single axes have logical strides equal to
+// physical strides. Check live selectors in the validator's original axis
+// order; its capacity proof bounds this exact integer sum.
+int64_t prepared_position(const DynamicIndexSpec& spec,
+                          const KernelCtx& context) {
+  int64_t position = 0;
+  for (const auto& a : spec.axes) {
+    const double raw = context.in[a.selector_input].data[a.input_offset];
+    if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 1 ||
+        raw > static_cast<double>(a.extent))
+      index_out_of_range();
+    position += (static_cast<int64_t>(raw) - 1) * a.stride;
+  }
+  return position;
+}
+
+void prepared_index_read(const DynamicIndexSpec& spec, KernelCtx& context) {
+  context.out.data[0] = context.in[0].data[prepared_position(spec, context)];
+}
+
+bool static_selection(const DynamicIndexSpec& spec) {
+  return std::all_of(spec.axes.begin(), spec.axes.end(), [](const auto& a) {
+    return a.count_input_offset < 0 && a.extent_input_offset < 0;
+  });
+}
+
+// index_positions for a static_selection whose successful first use proved
+// its geometry, so only the selector values need checking.
+template <class F>
+void prepared_positions(const DynamicIndexSpec& p, const KernelCtx& c, F&& f) {
+  IndexRuntime runtime(p.axes.size());
+  for (size_t d = 0; d < p.axes.size(); ++d) {
+    const auto& axis = p.axes[d];
+    auto& state = runtime.axes[d];
+    state.extent = axis.extent;
+    state.count = axis.count;
+    state.stride = axis.stride;
+    runtime.selected *= axis.count;
+    if (axis.kind == DynamicIndexSpec::Axis::All) continue;
+    state.selector = c.in[axis.selector_input].data;
+    if (axis.kind == DynamicIndexSpec::Axis::Range && axis.count == 0) continue;
+    const int64_t width =
+        axis.kind == DynamicIndexSpec::Axis::Multi ? axis.count : 1;
+    for (int64_t j = 0; j < width; ++j) {
+      const double raw = state.selector[axis.input_offset + j];
+      const double last = axis.kind == DynamicIndexSpec::Axis::Range
+                              ? raw + static_cast<double>(axis.count - 1)
+                              : raw;
+      if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 1 ||
+          last > static_cast<double>(axis.extent))
+        index_out_of_range();
+    }
+  }
+  selected_positions(p, runtime, f);
+}
+
 int64_t scalar_index_forward(KernelCtx& c) {
   const auto& p = *static_cast<const DynamicIndexSpec*>(c.udata);
   const int64_t fixed = fixed_scalar_index(p, c, false);
@@ -1382,6 +1475,9 @@ struct FrameTape {
   int64_t adjoint_base = 0;
   size_t version_peak = 0, recording_cells = 0;
   size_t layout_attempts = 0, layout_matches = 0;
+  // Offsets in the first frame of the initial slot values. Their versions are
+  // never owned, so no in-place write changes them during an evaluation.
+  std::vector<std::pair<int64_t, int64_t>> initial;
   bool ready = false;
 };
 
@@ -1464,6 +1560,12 @@ struct LoopState : KernelState {
   bool check_frame_layout =
       std::getenv("STANLI_STRUCTURED_CHECK_FRAME_LAYOUT") != nullptr;
   bool frame_clone = std::getenv("STANLI_NO_STRUCTURED_FRAME_CLONE") == nullptr;
+  bool frame_instance =
+      std::getenv("STANLI_NO_STRUCTURED_FRAME_INSTANCE") == nullptr;
+  const double* initial = nullptr;
+  bool check_frame_instance =
+      std::getenv("STANLI_STRUCTURED_CHECK_FRAME_INSTANCE") != nullptr;
+  std::vector<uint8_t> observable;
   bool last_replayed = false;
   size_t respecialized = 0;
 
@@ -1478,7 +1580,8 @@ struct LoopState : KernelState {
         loop_generation(plan.loop_count, 0),
         loop_version(plan.loop_count, -1),
         ctx(plan.site_count),
-        sites(plan.site_count, nullptr) {
+        sites(plan.site_count, nullptr),
+        observable(plan.site_count, 0) {
     no_replay |= !plan.cache_execution_path;
     const char* frame_option = std::getenv("STANLI_STRUCTURED_FRAMES");
     frame_mode = !no_replay && plan.outer_loop_index >= 0 &&
@@ -1492,6 +1595,7 @@ struct LoopState : KernelState {
       if (!n) throw std::logic_error("structured loop site numbering is stale");
       const Op& op = p.body.ops[n->op];
       has_reusable_primals |= n->reuse_primal_output;
+      observable[site] = op.opcode == OP_PRINT || op.opcode == OP_RNG;
       KernelCtx& c = ctx[site];
       c.n_in = op.n_in;
       c.variant = op.variant;
@@ -1668,6 +1772,11 @@ void reserve_remaining_trips(Stream& st, const RecordingPoolSizes& before,
 }
 
 #include "structured_recording.inc"
+#include "structured_memo.inc"
+#include "structured_instance.inc"
+
+struct Relocation;
+struct RecorderSnapshot;
 
 struct Execution {
   const StructuredLoop& p;
@@ -1676,7 +1785,69 @@ struct Execution {
   enum Flow { Normal, Break, Continue };
   std::unique_ptr<RecordingProgram> recording[2];
   int recording_enabled = -1;
+  bool instancing = false, observed = false;
+  std::unique_ptr<FrameInstances> instances;
+  TripCapture* capture = nullptr;
   Flow recording_forward(const Node& root, size_t which);
+  bool compiled_recording();
+  void observe();
+  FrameLoc locate(const double* ptr);
+  void image_state(StateImage& out, int64_t local);
+  std::vector<uint8_t> generations() const;
+  void begin_trip();
+  void end_trip(Flow flow);
+  void end_loop();
+  FrameInstances::Context context(size_t back) const;
+  bool predicted_current() const;
+  void note_frame();
+  void adopt(Flow flow, size_t instructions);
+  template <class F>
+  void plan_operands(const PlanOp& op, F&& f) const;
+  void plan_accesses(FrameTemplate& t) const;
+  void plan_schedule(FrameTemplate& t) const;
+  bool admit(const FrameTemplate& t, Relocation& r);
+  double* place(const Relocation& r, const FrameLoc& at, LoopFrame& local,
+                bool& ok) const;
+  bool run_plan(FrameTemplate& t, const Relocation& r, LoopFrame& frame,
+                double outer_value);
+  bool shift_bindings(const FrameTemplate& t, LoopFrame& frame);
+  void commit(const FrameTemplate& t, const Relocation& r,
+              std::unique_ptr<LoopFrame> frame);
+  bool instance_trip(double outer_value, Flow& flow,
+                     const std::function<Flow()>& record);
+  void snapshot(RecorderSnapshot& out) const;
+  void restore(const RecorderSnapshot& from);
+  void check_instance(const RecorderSnapshot& before,
+                      const std::function<Flow()>& record, Flow flow);
+  void forward_instance(const FrameTemplate& t, LoopFrame& frame);
+  static constexpr size_t no_memo = std::numeric_limits<size_t>::max();
+  template <bool Trace>
+  size_t dispatch(RecordingProgram& program, size_t pc, size_t stop,
+                  DataLoopTrace* trace);
+  size_t memo_enter(RecordingProgram& program, size_t pc);
+  template <class Operand>
+  bool memo_key(RecordingProgram& program, const DataLoopCandidate& candidate,
+                Operand&& operand);
+  const DataLoopMemo* memo_select(RecordingProgram& program, size_t pc,
+                                  bool keyed, bool& trace, uint64_t& hash);
+  void memo_replay(RecordingProgram& program, const DataLoopMemo& memo);
+  void run_step(RecordingProgram& program, size_t pc);
+  void trace_inputs(RecordingProgram& program, DataLoopTrace& trace,
+                    const Op& op);
+  void trace_condition(RecordingProgram& program, DataLoopTrace& trace,
+                       int slot);
+  void trace_stepped(RecordingProgram& program, DataLoopTrace& trace, int slot);
+  void trace_event(DataLoopTrace& trace, const DataLoopMemo::Event& event);
+  void trace_bump(DataLoopTrace& trace, int loop);
+  void trace_cells(RecordingProgram& program, DataLoopTrace& trace,
+                   const Node& n, int slot);
+  void trace_bound(RecordingProgram& program, DataLoopTrace& trace, int slot);
+  void trace_unbound(RecordingProgram& program, int slot);
+  void trace_capture(RecordingProgram& program, DataLoopTrace& trace, int slot,
+                     int64_t length);
+  void trace_kernel(RecordingProgram& program, DataLoopTrace& trace, size_t pc);
+  void trace_alias(RecordingProgram& program, DataLoopTrace& trace, size_t pc);
+  void trace_target(RecordingProgram& program, DataLoopTrace& trace, size_t pc);
 
   double* value(int slot) const {
     return s.versions[static_cast<size_t>(s.bindings[slot])].value;
@@ -1718,26 +1889,29 @@ struct Execution {
       return false;
     // The normal index kernel has already validated/evaluated this read.
     // Only constant selectors can fold it; varying selectors still replay.
-    const auto it = s.constant_cells.find(s.bindings[op.in[0]]);
+    const int64_t base = s.bindings[op.in[0]];
+    const auto it = s.constant_cells.find(base);
     if (it == s.constant_cells.end()) return false;
-    const auto& cells = it->second;
-    const auto& spec = *static_cast<const DynamicIndexSpec*>(op.udata);
-    const int64_t fixed = fixed_scalar_index(spec, c, false);
-    if (fixed >= 0) return cells[static_cast<size_t>(fixed)] != 0;
-    const IndexRuntime runtime = validate_index(spec, c, false);
-    // Capacity padding is not covered by the selection proof.
-    if (runtime.selected != c.out.len) return false;
-    bool constant = true;
-    selected_positions(spec, runtime, [&](int64_t, int64_t at) {
-      constant = constant && cells[static_cast<size_t>(at)];
-    });
+    const bool constant = selected_cells_constant(
+        it->second, *static_cast<const DynamicIndexSpec*>(op.udata), c);
+    if (capture) capture->cells(n, op, c, base, constant);
     return constant;
+  }
+  int64_t hold(int64_t version) {
+    Version& entry = s.versions[static_cast<size_t>(version)];
+    if (entry.constant) entry.owner = -1;
+    return version;
   }
   double* materialize(int64_t version, int64_t len) {
     double* v = s.versions[static_cast<size_t>(version)].value;
-    if (!is_const(version) || !in_workspace(v)) return v;
+    if (!is_const(version)) return v;
+    if (!in_workspace(v)) {
+      hold(version);
+      return v;
+    }
     double* copy = s.arena.allocate(len);
     std::copy_n(v, len, copy);
+    if (capture) capture->copy(v, copy, len);
     return copy;
   }
 
@@ -1767,17 +1941,12 @@ struct Execution {
     Stream& st = *s.building;
     const auto& spec = *static_cast<const DynamicIndexSpec*>(op.udata);
     const uint32_t pos_offset = static_cast<uint32_t>(st.gather_pos.size());
-    const int64_t fixed = fixed_scalar_index(spec, c, false);
-    if (fixed >= 0) {
-      st.gather_pos.push_back(fixed);
-    } else {
-      const IndexRuntime runtime = validate_index(spec, c, false);
-      selected_positions(spec, runtime, [&](int64_t, int64_t at) {
-        st.gather_pos.push_back(at);
-      });
-    }
+    index_positions(spec, c, false,
+                    [&](int64_t, int64_t at) { st.gather_pos.push_back(at); });
     const uint32_t pos_count =
         static_cast<uint32_t>(st.gather_pos.size()) - pos_offset;
+    if (capture)
+      capture->gather(n, op, c, st.gather_pos.data() + pos_offset, pos_count);
     double* src = materialize(s.bindings[op.in[0]], p.body.slots[op.in[0]].len);
     uint32_t adj_offset = 0;
     uint8_t flags = 0;
@@ -1841,6 +2010,7 @@ struct Execution {
     bind_inputs(op, c);
     n.forward(c);
     const bool folded = inputs_const(op) || selected_cells_const(n, op, c);
+    if (folded && capture) capture->kernel(n, op, c);
     s.bindings[op.out] = s.node_version[n.site];
     s.versions[static_cast<size_t>(s.node_version[n.site])].constant = folded;
     if (op.out2 >= 0) {
@@ -1856,7 +2026,7 @@ struct Execution {
     if (n.active && !s.building) {
       handles = static_cast<int64_t>(s.handles.size());
       for (int k = 0; k < op.n_in; ++k)
-        s.handles.push_back(s.bindings[op.in[k]]);
+        s.handles.push_back(hold(s.bindings[op.in[k]]));
     }
     const int64_t out_len = p.body.slots[op.out].len,
                   out2_len = op.out2 >= 0 ? c.out2.len : 0;
@@ -1873,6 +2043,7 @@ struct Execution {
     bind_inputs(op, c);
     n.forward(c);
     const bool folded = inputs_const(op) || selected_cells_const(n, op, c);
+    if (folded && capture) capture->kernel(n, op, c);
     const int64_t out =
         make_version(block, n.active ? reserve_adjoint(out_len) : -1, folded);
     s.bindings[op.out] = out;
@@ -1895,7 +2066,7 @@ struct Execution {
     if (!s.building) {
       handles = static_cast<int64_t>(s.handles.size());
       for (int k = 0; k < op.n_in; ++k)
-        s.handles.push_back(s.bindings[op.in[k]]);
+        s.handles.push_back(hold(s.bindings[op.in[k]]));
     }
     const bool folded = is_const(cached);
     const int64_t out = make_version(
@@ -1924,15 +2095,19 @@ struct Execution {
     if (!owned_for_this_write) {
       double* copy = s.arena.allocate(len);
       std::copy_n(s.versions[static_cast<size_t>(base)].value, len, copy);
+      if (capture)
+        capture->copy(s.versions[static_cast<size_t>(base)].value, copy, len);
       const bool needs_adjoint = !write_const && (rhs_active || active(base));
       const int64_t fresh = make_version(
           copy, needs_adjoint ? reserve_adjoint(len) : -1, write_const);
       if (s.building && s.cell_constants && !write_const) {
         if (is_const(base)) {
           s.constant_cells.emplace(fresh, std::vector<uint8_t>(len, 1));
+          if (capture) capture->flags(PlanOp::FlagsOnes, fresh, len);
         } else if (auto it = s.constant_cells.find(base);
                    it != s.constant_cells.end()) {
           s.constant_cells.emplace(fresh, it->second);
+          if (capture) capture->flags(PlanOp::FlagsCopy, fresh, base);
         }
       }
       s.versions[static_cast<size_t>(fresh)].owner = base_slot;
@@ -1954,9 +2129,13 @@ struct Execution {
       s.versions[static_cast<size_t>(base)].adjoint = reserve_adjoint(len);
       if (s.frames) {
         auto it = s.frames->promotion_links.find(base);
-        if (it != s.frames->promotion_links.end())
+        if (it != s.frames->promotion_links.end()) {
           s.frames->promotions[it->second] =
               s.versions[static_cast<size_t>(base)].adjoint;
+          if (capture)
+            capture->promotion(it->second,
+                               s.versions[static_cast<size_t>(base)].adjoint);
+        }
       }
     }
     bind_inputs(op, c);
@@ -1970,8 +2149,10 @@ struct Execution {
       if (auto it = s.constant_cells.find(rhs); it != s.constant_cells.end())
         rhs_cells = &it->second;
       auto it = s.constant_cells.find(base);
-      if (it == s.constant_cells.end() && (rhs_constant || rhs_cells))
+      if (it == s.constant_cells.end() && (rhs_constant || rhs_cells)) {
         it = s.constant_cells.emplace(base, std::vector<uint8_t>(len, 0)).first;
+        if (capture) capture->flags(PlanOp::FlagsZeros, base, len);
+      }
       if (it != s.constant_cells.end()) cells = &it->second;
     }
     const int64_t undo = static_cast<int64_t>(s.undo.size());
@@ -1996,13 +2177,12 @@ struct Execution {
         (*cells)[static_cast<size_t>(at)] =
             rhs_constant || (rhs_cells && (*rhs_cells)[static_cast<size_t>(i)]);
     };
-    const int64_t fixed = fixed_scalar_index(spec, c, true);
-    if (fixed >= 0) {
-      write(0, fixed);
-    } else {
-      const IndexRuntime runtime = validate_index(spec, c, true);
-      selected_positions(spec, runtime, write);
-    }
+    index_positions(spec, c, true, write);
+    if (capture)
+      capture->write(
+          n, op, c, base, rhs, write_const, cells != nullptr, rhs_constant,
+          rhs_cells != nullptr, s.building->inplace_pos.data() + pos_offset,
+          write_const ? 0 : s.building->inplace_pos.size() - pos_offset);
     if (!s.building)
       s.records.push_back(Record{Record::InPlace, n.site, undo, base, rhs});
     if (write_const) return;
@@ -2076,6 +2256,7 @@ struct Execution {
   __attribute__((always_inline)) void execute_kernel(const Node& n) {
     const Op& op = p.body.ops[n.op];
     KernelCtx& c = s.ctx[n.site];
+    if (s.observable[n.site]) observe();
     if (n.invariant_loop >= 0 &&
         s.node_generation[n.site] == s.loop_generation[n.invariant_loop]) {
       if (n.active) {
@@ -2169,10 +2350,24 @@ struct Execution {
         RecordingPoolSizes pools_before;
         if (prefix > 0) pools_before = recording_pool_sizes(*s.building);
         for (int64_t i = 0; i < count; ++i) {
-          bind_iterator(n, lo + static_cast<double>(i), bounds_const);
-          const Flow flow = framed ? recording_forward(n.children[0], 0)
-                                   : forward(n.children[0]);
-          if (framed) seal_frame(s);
+          Flow flow;
+          const double at = lo + static_cast<double>(i);
+          if (framed && instance_trip(at, flow, [&]() {
+                bind_iterator(n, at, bounds_const);
+                const Flow recorded = recording_forward(n.children[0], 0);
+                seal_frame(s);
+                return recorded;
+              })) {
+            if (flow == Break) break;
+            continue;
+          }
+          if (framed) begin_trip();
+          bind_iterator(n, at, bounds_const);
+          if (capture && bounds_const)
+            capture->outer_iterate(value(n.iterator));
+          flow = framed ? recording_forward(n.children[0], 0)
+                        : forward(n.children[0]);
+          if (framed) end_trip(flow);
           if (flow == Break) break;
           if (i + 1 == prefix) {
             if (prefer_frames(s, count, prefix)) {
@@ -2189,6 +2384,7 @@ struct Execution {
             }
           }
         }
+        if (framed) end_loop();
         return Normal;
       }
       case Node::While: {
@@ -2197,6 +2393,21 @@ struct Execution {
             s.frames && s.building && n.loop_index == p.outer_loop_index;
         if (framed) seal_frame(s);
         for (;;) {
+          Flow flow;
+          if (framed && instance_trip(0, flow, [&]() {
+                if (recording_forward(n.children[0], 1) == Break) return Break;
+                const double* cond = value(n.condition);
+                if (!is_const(s.bindings[n.condition]))
+                  log_guard_if(cond, cond[0] != 0.0);
+                if (cond[0] == 0.0) return Break;
+                const Flow recorded = recording_forward(n.children[1], 0);
+                seal_frame(s);
+                return recorded;
+              })) {
+            if (flow == Break) break;
+            continue;
+          }
+          if (framed) begin_trip();
           if ((framed ? recording_forward(n.children[0], 1)
                       : forward(n.children[0])) == Break)
             break;
@@ -2204,12 +2415,15 @@ struct Execution {
           const bool taken = cond[0] != 0.0;
           if (s.building && !is_const(s.bindings[n.condition]))
             log_guard_if(cond, taken);
+          else if (capture)
+            capture->decide(cond, taken);
           if (!taken) break;
-          const Flow flow = framed ? recording_forward(n.children[1], 0)
-                                   : forward(n.children[1]);
-          if (framed) seal_frame(s);
+          flow = framed ? recording_forward(n.children[1], 0)
+                        : forward(n.children[1]);
+          if (framed) end_trip(flow);
           if (flow == Break) break;
         }
+        if (framed) end_loop();
         return Normal;
       }
       case Node::Break:
@@ -2239,7 +2453,7 @@ struct Execution {
     if (n.active && !s.building) {
       handles = static_cast<int64_t>(s.handles.size());
       for (const auto& in : segment.ins)
-        s.handles.push_back(s.bindings[in.slot]);
+        s.handles.push_back(hold(s.bindings[in.slot]));
     }
     const bool log_inputs = s.building && !folded;
     const uint32_t seg_in_offset =
@@ -2360,11 +2574,7 @@ struct Execution {
 };
 
 Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
-  if (recording_enabled < 0) {
-    const char* option = std::getenv("STANLI_STRUCTURED_COMPILED_RECORDING");
-    recording_enabled = !option || option[0] != '0';
-  }
-  if (!recording_enabled) return forward(root);
+  if (!compiled_recording()) return forward(root);
   auto& owned = recording[which];
   if (!owned) {
     owned = std::make_unique<RecordingProgram>(root, s);
@@ -2372,17 +2582,28 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
       emit_diagnostic("stanli_structured compiled_recording: instructions=" +
                       std::to_string(owned->code.size()));
   }
-  auto& program = *owned;
-  size_t pc = 0;
-  while (pc < program.code.size()) {
+  const size_t pc = dispatch<false>(*owned, 0, 0, nullptr);
+  return pc == RecordingProgram::exit_break      ? Break
+         : pc == RecordingProgram::exit_continue ? Continue
+                                                 : Normal;
+}
+
+template <bool Trace>
+size_t Execution::dispatch(RecordingProgram& program, size_t pc, size_t stop,
+                           DataLoopTrace* trace) {
+  const size_t end = Trace ? stop : program.code.size();
+  while (pc < end) {
     auto& instruction = program.code[pc];
+    if constexpr (Trace) ++trace->executed;
     switch (instruction.kind) {
       case RecordingProgram::DataKernel: {
         const Node& n = *instruction.node;
         const auto& op = p.body.ops[n.op];
+        if constexpr (Trace) trace_inputs(program, *trace, op);
         auto& context = s.ctx[n.site];
         for (int k = 0; k < op.n_in; ++k) context.in[k].data = value(op.in[k]);
         n.forward(context);
+        if (capture) capture->kernel(n, op, context);
         ++s.effects;
         if (!instruction.jump) {
           const auto version = s.node_version[n.site];
@@ -2390,6 +2611,7 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
           s.versions[static_cast<size_t>(version)].constant = 1;
           instruction.jump = 1;
         }
+        if constexpr (Trace) trace_cells(program, *trace, n, op.out);
         ++pc;
         break;
       }
@@ -2397,9 +2619,14 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
       case RecordingProgram::DataBranch: {
         const Node& n = *instruction.node;
         const auto& op = p.body.ops[n.op];
+        if constexpr (Trace) trace_inputs(program, *trace, op);
         auto& context = s.ctx[n.site];
         for (int k = 0; k < op.n_in; ++k) context.in[k].data = value(op.in[k]);
         n.forward(context);
+        if (capture) {
+          capture->kernel(n, op, context);
+          capture->decide(context.out.data, context.out.data[0] != 0.0);
+        }
         ++s.effects;
         if (instruction.kind == RecordingProgram::DataBranchFresh) {
           const auto version = s.node_version[n.site];
@@ -2407,71 +2634,87 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
           s.versions[static_cast<size_t>(version)].constant = 1;
           instruction.kind = RecordingProgram::DataBranch;
         }
+        if constexpr (Trace) trace_cells(program, *trace, n, op.out);
         pc = context.out.data[0] != 0.0 ? pc + 2 : instruction.jump;
         break;
       }
       case RecordingProgram::DataIndex: {
         const Node& n = *instruction.node;
         const auto& op = p.body.ops[n.op];
+        if constexpr (Trace) trace_inputs(program, *trace, op);
         auto& context = s.ctx[n.site];
         for (int k = 0; k < op.n_in; ++k) context.in[k].data = value(op.in[k]);
-        if (!instruction.jump) {
+        const bool prepared = instruction.jump != 0;
+        if (!prepared) {
           n.forward(context);
           const auto version = s.node_version[n.site];
           s.bindings[op.out] = version;
           s.versions[static_cast<size_t>(version)].constant = 1;
           instruction.jump = 1;
         } else {
-          // Successful first use proved immutable descriptor/slot geometry.
-          // Fixed Single axes have logical strides equal to physical strides.
-          // Check live selectors in the validator's original axis order; its
-          // capacity proof bounds this exact integer sum. Refreshing bindings
-          // above also handles aliases and frame compaction.
-          const auto& spec = *static_cast<const DynamicIndexSpec*>(op.udata);
-          int64_t position = 0;
-          for (const auto& a : spec.axes) {
-            const double raw =
-                context.in[a.selector_input].data[a.input_offset];
-            if (!std::isfinite(raw) || std::trunc(raw) != raw || raw < 1 ||
-                raw > static_cast<double>(a.extent))
-              index_out_of_range();
-            position += (static_cast<int64_t>(raw) - 1) * a.stride;
-          }
-          context.out.data[0] = context.in[0].data[position];
+          // Refreshing bindings above also handles aliases and frame
+          // compaction.
+          prepared_index_read(*static_cast<const DynamicIndexSpec*>(op.udata),
+                              context);
         }
+        if (capture) capture->kernel(n, op, context, prepared);
         ++s.effects;
+        if constexpr (Trace) trace_cells(program, *trace, n, op.out);
         ++pc;
         break;
       }
       case RecordingProgram::Kernel:
-        execute_kernel(*instruction.node);
+        if constexpr (Trace)
+          trace_kernel(program, *trace, pc);
+        else
+          execute_kernel(*instruction.node);
         ++pc;
         break;
       case RecordingProgram::Alias:
-        execute_alias(*instruction.node);
+        if constexpr (Trace)
+          trace_alias(program, *trace, pc);
+        else
+          execute_alias(*instruction.node);
         ++pc;
         break;
       case RecordingProgram::Target:
-        execute_target(*instruction.node);
+        if constexpr (Trace)
+          trace_target(program, *trace, pc);
+        else
+          execute_target(*instruction.node);
         ++pc;
         break;
       case RecordingProgram::Leaf:
+        if constexpr (Trace) trace->ok = false;
         (void)run(*instruction.node);
         ++pc;
         break;
       case RecordingProgram::Branch:
       case RecordingProgram::WhileTest: {
         const Node& n = *instruction.node;
+        if constexpr (Trace) trace_condition(program, *trace, n.condition);
         const double* condition = value(n.condition);
         const bool taken = condition[0] != 0.0;
         if (s.building && !is_const(s.bindings[n.condition]))
           log_guard_if(condition, taken);
+        else if (capture)
+          capture->decide(condition, taken);
         pc = taken ? pc + 1 : instruction.jump;
         break;
       }
+      case RecordingProgram::MemoForEnter:
+        if constexpr (!Trace) {
+          const size_t next = memo_enter(program, pc);
+          if (next != no_memo) {
+            pc = next;
+            break;
+          }
+        }
+        [[fallthrough]];
       case RecordingProgram::ForEnter: {
         const Node& n = *instruction.node;
         ++s.loop_generation[n.loop_index];
+        if constexpr (Trace) trace_bump(*trace, n.loop_index);
         const double lo = value(n.lower)[0], hi = value(n.upper)[0];
         if (!std::isfinite(lo) || !std::isfinite(hi) || std::trunc(lo) != lo ||
             std::trunc(hi) != hi || lo < std::numeric_limits<int32_t>::min() ||
@@ -2485,10 +2728,20 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
         cursor.iteration = 0;
         cursor.constant =
             is_const(s.bindings[n.lower]) && is_const(s.bindings[n.upper]);
+        if constexpr (Trace) {
+          trace_condition(program, *trace, n.lower);
+          trace_condition(program, *trace, n.upper);
+        }
         if (s.building && !cursor.constant)
           log_guard_for(value(n.lower), value(n.upper), lo, hi);
+        else if (capture)
+          capture->bounds(n.loop_index, value(n.lower), value(n.upper),
+                          cursor.count);
         if (cursor.count) {
           bind_iterator(n, lo, cursor.constant);
+          if (capture && cursor.constant)
+            capture->iterate(value(n.iterator), n.loop_index, 0);
+          if constexpr (Trace) trace_cells(program, *trace, n, n.iterator);
           ++pc;
         } else {
           pc = instruction.jump;
@@ -2501,6 +2754,9 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
         if (++cursor.iteration < cursor.count) {
           bind_iterator(n, cursor.lower + static_cast<double>(cursor.iteration),
                         cursor.constant);
+          if (capture && cursor.constant)
+            capture->iterate(value(n.iterator), n.loop_index, cursor.iteration);
+          if constexpr (Trace) trace_cells(program, *trace, n, n.iterator);
           pc = instruction.jump;
         } else {
           ++pc;
@@ -2515,14 +2771,28 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
         if (++cursor.iteration < cursor.count) {
           s.workspace[n.workspace] =
               cursor.lower + static_cast<double>(cursor.iteration);
+          if (capture)
+            capture->iterate(&s.workspace[n.workspace], n.loop_index,
+                             cursor.iteration);
+          if constexpr (Trace) trace_cells(program, *trace, n, n.iterator);
           pc = instruction.jump;
         } else {
           ++pc;
         }
         break;
       }
+      case RecordingProgram::MemoWhileEnter:
+        if constexpr (!Trace) {
+          const size_t next = memo_enter(program, pc);
+          if (next != no_memo) {
+            pc = next;
+            break;
+          }
+        }
+        [[fallthrough]];
       case RecordingProgram::WhileEnter:
         ++s.loop_generation[instruction.node->loop_index];
+        if constexpr (Trace) trace_bump(*trace, instruction.node->loop_index);
         ++pc;
         break;
       case RecordingProgram::ExitJump:
@@ -2533,10 +2803,10 @@ Execution::Flow Execution::recording_forward(const Node& root, size_t which) {
         break;
     }
   }
-  return pc == RecordingProgram::exit_break      ? Break
-         : pc == RecordingProgram::exit_continue ? Continue
-                                                 : Normal;
+  return pc;
 }
+
+#include "structured_memo_run.inc"
 
 void collect_live_ranges(LoopState& s, Stream& st,
                          std::vector<std::pair<const double*, int64_t>>& live) {
@@ -3154,6 +3424,7 @@ void replay_backward(LoopState& s, KernelCtx& ctx) {
 }
 
 #include "structured_frames.inc"
+#include "structured_instance_run.inc"
 
 KernelState* make_loop_state(const Op& op, const Slot*) {
   return new LoopState(*static_cast<const StructuredLoop*>(op.udata));
@@ -3304,45 +3575,16 @@ void emit_replay_diagnostic(const LoopState& s, bool replayed,
       " respecialized=" + std::to_string(s.respecialized));
 }
 
-void structured_loop_forward(KernelCtx& ctx) {
-  LoopState& s = require_state(ctx);
+// Resets the recorder and binds the initial values, imports and workspace.
+void start_recording(LoopState& s, Execution& e, KernelCtx& ctx) {
   const StructuredLoop& p = s.p;
-  s.reverse_ready = false;
-  s.frame_clone_ready = false;
-  if (s.frames && !s.frames->ready) s.frames.reset();
-  if (s.frames && s.frames->ready) {
-    if (frames_forward(s, ctx)) {
-      s.reverse_ready = true;
-      s.frame_clone_ready = true;
-      return;
-    }
-    s.frames.reset();
-    ++s.respecialized;
-  }
-  if (s.stream && !s.no_replay) {
-    if (replay_forward(s, ctx)) {
-      s.last_replayed = true;
-      s.reverse_ready = true;
-      if (s.diagnostics)
-        emit_replay_diagnostic(
-            s, true, s.stream->program.size(),
-            s.stream->guards_if.size() + s.stream->guards_for.size(),
-            s.stream->arena.cells.size(), s.stream->backward_order.size());
-      return;
-    }
-    s.stream.reset();
-    ++s.respecialized;
-  }
-  s.last_replayed = false;
   s.release();
-  int64_t expected = p.has_target ? 1 : 0;
-  for (int slot : p.outputs) expected += p.body.slots[slot].len;
-  if (expected != ctx.out.len)
-    throw std::logic_error("structured output size mismatch");
+  s.building.reset();
+  s.frames.reset();
   if (!s.no_replay) s.building = std::make_unique<Stream>();
   if (s.frame_mode) s.frames = std::make_unique<FrameTape>();
-  Execution e{p, s, ctx};
   double* initial = s.arena.allocate(p.initial_size);
+  s.initial = initial;
   std::fill_n(initial, p.initial_size, 0.0);
   s.bindings.resize(p.body.slots.size());
   for (size_t slot = 0; slot < p.body.slots.size(); ++slot)
@@ -3402,8 +3644,56 @@ void structured_loop_forward(KernelCtx& ctx) {
     }
   }
   for (auto& c : s.ctx) c.eval_state = ctx.eval_state;
+}
 
-  e.forward(p.root);
+void structured_loop_forward(KernelCtx& ctx) {
+  LoopState& s = require_state(ctx);
+  const StructuredLoop& p = s.p;
+  s.reverse_ready = false;
+  s.frame_clone_ready = false;
+  if (s.frames && !s.frames->ready) s.frames.reset();
+  if (s.frames && s.frames->ready) {
+    if (frames_forward(s, ctx)) {
+      s.reverse_ready = true;
+      s.frame_clone_ready = true;
+      return;
+    }
+    s.frames.reset();
+    ++s.respecialized;
+  }
+  if (s.stream && !s.no_replay) {
+    if (replay_forward(s, ctx)) {
+      s.last_replayed = true;
+      s.reverse_ready = true;
+      if (s.diagnostics)
+        emit_replay_diagnostic(
+            s, true, s.stream->program.size(),
+            s.stream->guards_if.size() + s.stream->guards_for.size(),
+            s.stream->arena.cells.size(), s.stream->backward_order.size());
+      return;
+    }
+    s.stream.reset();
+    ++s.respecialized;
+  }
+  s.last_replayed = false;
+  int64_t expected = p.has_target ? 1 : 0;
+  for (int slot : p.outputs) expected += p.body.slots[slot].len;
+  if (expected != ctx.out.len)
+    throw std::logic_error("structured output size mismatch");
+  std::unique_ptr<Execution> recorder;
+  size_t restarts = 0;
+  for (;;) {
+    recorder.reset(new Execution{p, s, ctx});
+    recorder->instancing = s.frame_instance && restarts == 0;
+    start_recording(s, *recorder, ctx);
+    try {
+      recorder->forward(p.root);
+      break;
+    } catch (const FrameInstanceRestart&) {
+      ++restarts;
+    }
+  }
+  Execution& e = *recorder;
   if (s.frames) {
     if (s.diagnostics) {
       size_t spans = 0, published = 0, indices = 0, index_prepared = 0,
@@ -3429,6 +3719,44 @@ void structured_loop_forward(KernelCtx& ctx) {
                             instruction.jump != 0;
         }
       }
+      size_t memo_candidates = 0, memo_invariants = 0, memo_hits = 0,
+             memo_misses = 0, memo_aborted = 0, memo_skipped = 0,
+             memo_events = 0, memo_bytes = 0;
+      for (const auto& program : e.recording) {
+        if (!program) continue;
+        for (const auto& candidate : program->candidates) {
+          ++memo_candidates;
+          memo_invariants += candidate.invariants.size();
+          memo_hits += candidate.hits;
+          memo_misses += candidate.misses;
+          memo_aborted += candidate.aborted;
+          memo_skipped += candidate.skipped;
+          memo_events += candidate.events;
+          for (const auto& bucket : candidate.memos)
+            for (const auto& memo : bucket.second)
+              memo_bytes +=
+                  sizeof(DataLoopMemo) +
+                  memo->key.capacity() * sizeof(uint64_t) +
+                  (memo->events.capacity() + memo->finals.capacity()) *
+                      sizeof(DataLoopMemo::Event) +
+                  memo->pool.capacity() * sizeof(double);
+        }
+      }
+      emit_diagnostic("stanli_structured data_loop_memo: memo_candidates=" +
+                      std::to_string(memo_candidates) +
+                      " memo_invariants=" + std::to_string(memo_invariants) +
+                      " memo_hits=" + std::to_string(memo_hits) +
+                      " memo_misses=" + std::to_string(memo_misses) +
+                      " memo_aborted=" + std::to_string(memo_aborted) +
+                      " memo_skipped=" + std::to_string(memo_skipped) +
+                      " memo_events=" + std::to_string(memo_events) +
+                      " memo_bytes=" + std::to_string(memo_bytes));
+      const FrameInstances* in = e.instances.get();
+      emit_diagnostic("stanli_structured frame_instances: instantiated=" +
+                      std::to_string(in ? in->instantiated : 0) +
+                      " fallback=" + std::to_string(in ? in->fallback : 0) +
+                      " refused=" + std::to_string(in ? in->refused : 0) +
+                      " restarts=" + std::to_string(restarts));
       emit_diagnostic("stanli_structured recording_proofs: data_kernels=" +
                       std::to_string(spans) +
                       " data_published=" + std::to_string(published) +

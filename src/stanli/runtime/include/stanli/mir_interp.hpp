@@ -404,7 +404,7 @@ class MirInterp {
         // same write with an explicit `:` for every remaining dimension.
         // First-index-fast storage makes those trailing values a strided
         // sequence at offset + prefix_stride*k.
-        if (en->dims.size() > 2 && !st.lhs_idx.empty()) {
+        if (en->dims.size() >= 2 && !st.lhs_idx.empty()) {
           size_t prefix_len = 0;
           while (prefix_len < st.lhs_idx.size() &&
                  st.lhs_idx[prefix_len].name == "IndexSingle")
@@ -448,13 +448,6 @@ class MirInterp {
                                      : en->dims.front();
           if (ix < 1 || ix > extent)
             fail("indexed assignment index out of bounds", st.raw);
-          if (en->dims.size() == 2) {
-            // Row write into a matrix (A[i] = row_vector), col-major strided.
-            const int64_t R = en->dims[0], C = en->dims[1];
-            if ((int64_t)v.r.size() != C) fail("row write size mismatch");
-            for (int64_t j = 0; j < C; ++j) en->r.at(j * R + (ix - 1)) = v.r[j];
-            return;
-          }
           en->r.at(ix - 1) = v.r.at(0);
           if (en->is_int) {
             en->i.at(ix - 1) =
@@ -1072,8 +1065,7 @@ class MirInterp {
 
   [[noreturn]] void fail(const std::string& msg,
                          const std::string& raw = "") const {
-    throw CompileError("stanli " + where_ + ": " + msg +
-                       (raw.empty() ? "" : " | in: " + raw));
+    throw CompileError(msg + (raw.empty() ? "" : " | in: " + raw));
   }
 
   // The .at() reads in eval_indexed would throw a bare
@@ -1120,8 +1112,7 @@ class MirInterp {
   }
 
   [[noreturn]] void check_shape_fail(const std::string& name) const {
-    throw std::invalid_argument("stanli " + where_ +
-                                ": constraint shapes do not match for " + name);
+    throw std::invalid_argument("constraint shapes do not match for " + name);
   }
 
   void exec_matching_dims(const mir::Stmt& st) {
@@ -1217,15 +1208,15 @@ class MirInterp {
           y.r.size() != bound.r.size())
         check_shape_fail(name);
     }
-    for (size_t i = 0; i < y.r.size(); ++i) {
-      const double b = val(bound.r[b_scalar ? 0 : i]);
-      if (kind == mir::Transform::Lower)
-        stan::math::check_greater_or_equal("stanli MIR check", name.c_str(),
-                                           val(y.r[i]), b);
-      else
-        stan::math::check_less_or_equal("stanli MIR check", name.c_str(),
-                                        val(y.r[i]), b);
-    }
+    without_check_prefix([&] {
+      for (size_t i = 0; i < y.r.size(); ++i) {
+        const double b = val(bound.r[b_scalar ? 0 : i]);
+        if (kind == mir::Transform::Lower)
+          stan::math::check_greater_or_equal("", name.c_str(), val(y.r[i]), b);
+        else
+          stan::math::check_less_or_equal("", name.c_str(), val(y.r[i]), b);
+      }
+    });
   }
 
   // max-shifted log-sum-exp over a buffer; -inf on an empty or all
@@ -1754,6 +1745,34 @@ class MirInterp {
       for (size_t i = 0; i < a.r.size(); ++i) o.r[i] = f(a.r[i]);
       return o;
     };
+    if (const BuiltinSpec* ordering =
+            builtin != nullptr && builtin->ordering != BuiltinOrdering::None &&
+                    builtin->result == FunctionArgumentKind::Integer
+                ? builtin
+                : nullptr) {
+      const Value a = eval(e.args[0]);
+      std::vector<double> values;
+      if (a.is_int && !a.i.empty()) {
+        values.assign(a.i.begin(), a.i.end());
+      } else {
+        values.reserve(a.r.size());
+        for (const T& lane : a.r) values.push_back(val(lane));
+      }
+      const int position = ordering->ordering == BuiltinOrdering::Rank
+                               ? (int)as_int(e.args[1])
+                               : 0;
+      Value o;
+      o.is_int = true;
+      o.i = evaluate_ordering_builtin(*ordering, values, position);
+      o.r.reserve(o.i.size());
+      for (const int value : o.i) o.r.push_back(T((double)value));
+      if (ordering->ordering == BuiltinOrdering::SortAsc ||
+          ordering->ordering == BuiltinOrdering::SortDesc)
+        o.dims = a.dims;
+      else if (ordering->ordering != BuiltinOrdering::Rank)
+        o.dims = {(int64_t)o.i.size()};
+      return o;
+    }
     if (builtin != nullptr &&
         builtin->shape == BuiltinShapePolicy::Elementwise &&
         builtin->result == FunctionArgumentKind::Integer) {
@@ -1771,6 +1790,21 @@ class MirInterp {
         }
       };
       restore_legacy_integer(0, &a);
+      if (builtin->arity == 1 && !builtin_argument_is_integer(*builtin, 0)) {
+        (void)resolve_registered({a});
+        Value o;
+        o.is_int = true;
+        o.dims = a.dims;
+        o.i.resize(a.r.size());
+        o.r.resize(a.r.size());
+        for (size_t i = 0; i < a.r.size(); ++i) {
+          const int value =
+              evaluate_real_to_integer_builtin(*builtin, val(a.r[i]));
+          o.i[i] = value;
+          o.r[i] = T((double)value);
+        }
+        return o;
+      }
       if (!a.is_int) fail(e.name + ": expected integer arguments", e.raw);
       if (builtin->arity == 1) {
         (void)resolve_registered({a});

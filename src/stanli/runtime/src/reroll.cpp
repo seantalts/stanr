@@ -594,7 +594,7 @@ int fuse_log_sum_exp_rows(Graph& g, std::vector<int>& target_terms,
 static RerollStats reroll_impl(
     Graph& g, std::vector<std::pair<int, std::vector<double>>>& fills,
     std::vector<int>& target_terms, const std::vector<int>& extra_roots,
-    detail::RerollDispositionStats* dispositions) {
+    detail::RerollDispositionStats* dispositions, bool fuse_shared_params) {
   RerollStats st;
   if (std::getenv("STANLI_NO_REROLL")) return st;
 
@@ -803,12 +803,12 @@ static RerollStats reroll_impl(
 
       // ---- classify, shrinking to the reported prefix on failure ----
       detail::reroll_plan::CandidatePlan plan;
+      plan.price_distinct_ops = fuse_shared_params;
       std::vector<Pos>& pos = plan.positions;
       bool layout_set = false;  // has the region committed to a convention
       bool& layout_cols = plan.column_major;  // column-major, once committed
       int64_t Luse = doomed ? 0 : L;
-      using SelectedPlan =
-          detail::reroll_plan::SelectedPlan<detail::reroll_plan::GraphSource>;
+      using SelectedPlan = detail::reroll_plan::SelectedPlan;
       std::optional<SelectedPlan> selected;
       for (int attempt = 0;
            !doomed && attempt < kMaxClassifyAttempts && Luse >= kMinLanes;
@@ -900,7 +900,6 @@ static RerollStats reroll_impl(
             int64_t br_const = Luse;
             const int64_t cw = g.slots[t.in[j]].len;
             std::vector<double> vals;
-            vals.reserve((size_t)(Luse * cw));
             for (int64_t l = 0; l < Luse; ++l) {
               const int s = op_at(p, l).in[j];
               if (cw == 1) {
@@ -1073,9 +1072,21 @@ static RerollStats reroll_impl(
                 return u >= i && u < region_end &&
                        (u - i) % (size_t)P == (size_t)p;
               };
+              auto own_element_read = [&](size_t u) {
+                const size_t q = (u - i) % (size_t)P;
+                const Op& rd = g.ops[u];
+                return q < (size_t)p && rd.opcode == OP_INDEX && rd.n_in == 1 &&
+                       rd.in[0] == vec && rd.n_idata == 1 &&
+                       rd.idata[0] ==
+                           op_at(p, (int64_t)((u - i) / (size_t)P)).idata[0];
+              };
               const std::vector<size_t>& vec_uses = uses[(size_t)vec];
               const std::vector<size_t>& vec_writers = writers[(size_t)vec];
-              if (any_in_range_but(vec_uses, i, region_end, in_region_write) ||
+              if (any_in_range_but(vec_uses, i, region_end,
+                                   [&](size_t u) {
+                                     return in_region_write(u) ||
+                                            own_element_read(u);
+                                   }) ||
                   any_in_range_but(vec_writers, i, region_end, in_region_write))
                 clean = false;
               if (any_at_or_after(vec_writers, region_end, st.list_steps))
@@ -1083,7 +1094,8 @@ static RerollStats reroll_impl(
             }
             if (!clean || br_run < Luse) {
               ok = false;
-              prefix = std::min(prefix, clean ? br_run : (int64_t)0);
+              if (ap.ins[0].kind == InKind::kInvariant)
+                prefix = std::min(prefix, clean ? br_run : (int64_t)0);
             } else {
               ap.store_vec = vec;
               ap.store_src = vec;
@@ -1143,9 +1155,25 @@ static RerollStats reroll_impl(
                 return u >= i && u < region_end &&
                        (u - i) % (size_t)P == (size_t)p;
               };
+              auto own_row_read = [&](size_t u) {
+                const size_t q = (u - i) % (size_t)P;
+                const Op& rd = g.ops[u];
+                const Op& st_op = op_at(p, (int64_t)((u - i) / (size_t)P));
+                if (q >= (size_t)p || !is_row_read(rd) || rd.in[0] != vec ||
+                    rd.n_idata != st_op.n_idata ||
+                    is_strided(rd.opcode) != strided)
+                  return false;
+                for (int64_t k = 0; k < rd.n_idata; ++k)
+                  if (rd.idata[k] != st_op.idata[k]) return false;
+                return true;
+              };
               const std::vector<size_t>& vec_uses = uses[(size_t)vec];
               const std::vector<size_t>& vec_writers = writers[(size_t)vec];
-              if (any_in_range_but(vec_uses, i, region_end, in_region_write) ||
+              if (any_in_range_but(vec_uses, i, region_end,
+                                   [&](size_t u) {
+                                     return in_region_write(u) ||
+                                            own_row_read(u);
+                                   }) ||
                   any_in_range_but(vec_writers, i, region_end, in_region_write))
                 clean = false;
               if (any_at_or_after(vec_writers, region_end, st.list_steps))
@@ -1353,7 +1381,7 @@ static RerollStats reroll_impl(
           }
           lane0_producer[t.out] = p;
         }
-        if (ok) {
+        if (ok && !fuse_shared_params) {
           // Widening evaluates one reverse operation across all lanes before
           // moving to the preceding operation. A shared active scalar read
           // at multiple positions would therefore receive regrouped, rather
@@ -1455,18 +1483,21 @@ static RerollStats reroll_impl(
 RerollStats reroll(Graph& g,
                    std::vector<std::pair<int, std::vector<double>>>& fills,
                    std::vector<int>& target_terms,
-                   const std::vector<int>& extra_roots) {
-  return reroll_impl(g, fills, target_terms, extra_roots, nullptr);
+                   const std::vector<int>& extra_roots,
+                   bool fuse_shared_params) {
+  return reroll_impl(g, fills, target_terms, extra_roots, nullptr,
+                     fuse_shared_params);
 }
 
 namespace detail {
 
 ProfiledRerollStats reroll_profiled(
     Graph& g, std::vector<std::pair<int, std::vector<double>>>& fills,
-    std::vector<int>& target_terms, const std::vector<int>& extra_roots) {
+    std::vector<int>& target_terms, const std::vector<int>& extra_roots,
+    bool fuse_shared_params) {
   ProfiledRerollStats result;
-  result.work =
-      reroll_impl(g, fills, target_terms, extra_roots, &result.dispositions);
+  result.work = reroll_impl(g, fills, target_terms, extra_roots,
+                            &result.dispositions, fuse_shared_params);
   return result;
 }
 
